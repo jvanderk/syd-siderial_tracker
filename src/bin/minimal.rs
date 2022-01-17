@@ -16,8 +16,6 @@ mod app {
         prelude::*,
     };
 
-
-
     #[monotonic(binds = SysTick, default = true)]
     type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
 
@@ -25,6 +23,7 @@ mod app {
     #[shared]
     struct Shared {
         // TODO: Add resources
+        tracking: bool, // is system in tracking state? if not: retracting
     }
 
     // Local resources go here
@@ -52,8 +51,10 @@ mod app {
             .freeze(&mut flash.acr);
 
         // Set up the LED.
-        let onboard_led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
-        let signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
+        let mut onboard_led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
+        onboard_led.set_high(); // not sure why unwrap is not implemented.
+        let mut signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
+        signal_led.set_low();
 
         let mono = DwtSystick::new(
             &mut cx.core.DCB,
@@ -62,12 +63,16 @@ mod app {
             clocks.hclk().0,
         );
 
-        blink::spawn_after(1.secs()).ok();
+        // app setup
+        //let tracking: bool = false;
 
-        // Setup the monotonic timer
+        main::spawn_after(1.millis()).ok();
+
+        // return the resources (and the monotonic timer?)
         (
             Shared {
                 // Initialization of shared resources go here
+                tracking: false
             },
             Local {
                 // Initialization of local resources go here
@@ -88,11 +93,28 @@ mod app {
     }
 
     // TODO: Add tasks
-    #[task(local=[onboard_led,signal_led])]
-    fn blink(cx: blink::Context) {
-        defmt::info!("Blink!");
-        cx.local.onboard_led.toggle();
-        cx.local.signal_led.toggle();
-        blink::spawn_after(500.millis()).ok();
+    // &- means that shared resource is 'not locked'
+    #[task(shared=[tracking], local=[onboard_led,signal_led])]
+    fn main(mut cx: main::Context) {
+        //defmt::info!("main!");
+
+        let mut tracking = cx.shared.tracking;
+        let mut onboard_led = cx.local.onboard_led;
+        let mut signal_led = cx.local.signal_led;
+
+        (tracking).lock(|tracking| {
+            if *tracking {
+                // track
+                *tracking = false;
+                onboard_led.set_low();
+                signal_led.set_high();
+            } else {
+                // retract and check if we are stalling
+                *tracking = true;
+                onboard_led.set_high();
+                signal_led.set_low();
+            }
+        });
+        main::spawn_after(500.millis()).ok();
     }
 }
