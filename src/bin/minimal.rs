@@ -9,7 +9,10 @@ mod app {
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
 
     use stm32f1xx_hal::{
-        gpio::{gpioc::PC13, Output, PushPull},
+        gpio::{gpioa::{PA0,PA1,PA2}, Output, PushPull},
+        gpio::{gpioa::{PA3}, Input, Floating, PullUp},
+        gpio::{gpiob::{PB6,PB7}},
+        gpio::{gpioc::{PC13}},
         prelude::*,
     };
 
@@ -27,7 +30,8 @@ mod app {
     // Local resources go here
     #[local]
     struct Local {
-        led: PC13<Output<PushPull>>,
+        onboard_led: PC13<Output<PushPull>>,
+        signal_led: PA2<Output<PushPull>>,
     }
 
     #[init]
@@ -39,14 +43,17 @@ mod app {
         let rcc = cx.device.RCC.constrain();
 
         // Acquire the GPIOC peripherals
-        // let mut gpioa = dp.GPIOA.split(&mut rcc.apb2); // pwm motor control
+        let mut gpioa = cx.device.GPIOA.split();
         // let mut gpiob = dp.GPIOB.split(&mut rcc.apb2); // quadrature counter
         let mut gpioc = cx.device.GPIOC.split();
-        let clocks = rcc.cfgr.sysclk(48.mhz()).freeze(&mut flash.acr);
+        let clocks = rcc
+            .cfgr
+            .sysclk(48.mhz())
+            .freeze(&mut flash.acr);
 
         // Set up the LED.
-        let led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
-
+        let onboard_led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
+        let signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
 
         let mono = DwtSystick::new(
             &mut cx.core.DCB,
@@ -64,7 +71,8 @@ mod app {
             },
             Local {
                 // Initialization of local resources go here
-                led
+                onboard_led,
+                signal_led
             },
             init::Monotonics(mono),
         )
@@ -80,10 +88,11 @@ mod app {
     }
 
     // TODO: Add tasks
-    #[task(local=[led])]
+    #[task(local=[onboard_led,signal_led])]
     fn blink(cx: blink::Context) {
         defmt::info!("Blink!");
-        cx.local.led.toggle();
+        cx.local.onboard_led.toggle();
+        cx.local.signal_led.toggle();
         blink::spawn_after(500.millis()).ok();
     }
 }
