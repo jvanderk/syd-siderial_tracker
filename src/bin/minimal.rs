@@ -28,7 +28,6 @@ mod app {
         // TODO: Add resources
         tracking: bool, // is system in tracking state? if not: retracting
         t: i64,         // discrete time in tenths of seconds
-        tmr2: CountDownTimer<stm32::TIM2>,
     }
 
     // Local resources go here
@@ -38,6 +37,7 @@ mod app {
         signal_led: PA2<Output<PushPull>>,
         last_pos: i64,
         last_pos_change_time: i64,
+        tmr2: CountDownTimer<stm32::TIM2>,
     }
 
     #[init]
@@ -80,7 +80,7 @@ mod app {
 
         // Use TIM2 for the PID counter task
         let mut tmr2 =
-            Timer::tim2(cx.device.TIM2, &clocks).start_count_down(800.hz());
+            Timer::tim2(cx.device.TIM2, &clocks).start_count_down(4.hz());
         tmr2.listen(Event::Update);
 
         //let tracking: bool = false;
@@ -92,8 +92,7 @@ mod app {
             Shared {
                 // Initialization of shared resources go here
                 tracking: false,
-                t: 0,
-                tmr2
+                t: 0
             },
             Local {
                 // Initialization of local resources go here
@@ -101,6 +100,7 @@ mod app {
                 signal_led,
                 last_pos: 0,
                 last_pos_change_time: 0,
+                tmr2
             },
             init::Monotonics(mono),
         )
@@ -117,13 +117,12 @@ mod app {
 
     // TODO: Add tasks
     // &- means that shared resource is 'not locked'
-    #[task(shared=[tracking, t], local=[onboard_led,signal_led])]
+    #[task(shared=[tracking, t], local=[signal_led])]
     fn main(cx: main::Context) {
         //defmt::info!("main!");
 
         let tracking = cx.shared.tracking;
         let t = cx.shared.t;
-        let onboard_led = cx.local.onboard_led;
         let signal_led = cx.local.signal_led;
 
         (tracking, t).lock(|tracking, t| {
@@ -131,16 +130,38 @@ mod app {
                 // track
                 *tracking = false;
                 *t += 5;
-                onboard_led.set_low();
                 signal_led.set_high();
             } else {
                 // retract and check if we are stalling
                 *tracking = true;
                 *t += 5;
-                onboard_led.set_high();
                 signal_led.set_low();
             }
         });
         main::spawn_after(500.millis()).ok();
     }
+
+
+    // Interrupt task for TIM2, the PID counter timer
+    #[task(binds = TIM2, priority = 1, local = [tmr2])]
+    fn tim2(cx: tim2::Context) {
+        // Delegate the state update to a software task
+        pid_update::spawn().unwrap();
+        // Restart the timer and clear the interrupt flag
+        cx.local.tmr2.start(4.hz());
+        cx.local.tmr2.clear_update_interrupt_flag();
+    }
+
+
+    // update the PID loop
+    #[task(shared = [t], local = [onboard_led])]
+    fn pid_update(cx: pid_update::Context) {
+        let onboard_led = cx.local.onboard_led;
+        let mut t = cx.shared.t;
+        t.lock(|t| {
+            *t += 1;
+            onboard_led.toggle();
+        })
+    }
+
 }
