@@ -4,20 +4,27 @@
 
 use syd as _; // global logger + panicking-behavior + memory layout
 
+
 #[rtic::app(device =  stm32f1xx_hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
 
     use stm32f1xx_hal::{
-        gpio::{gpioa::{PA0,PA1,PA2}, Output, PushPull},
+        gpio::{gpioa::{PA0,PA1,PA2}, Alternate, Output, PushPull},
         gpio::{gpioa::{PA3}, Input, Floating, PullUp},
         gpio::{gpiob::{PB6,PB7}},
         gpio::{gpioc::{PC13}},
         prelude::*,
-        timer::{Event, Timer, CountDownTimer},
+        timer::{Event, Timer, CountDownTimer,Tim2NoRemap},
         stm32,
+        qei::QeiOptions,
     };
+
+    // wrapper around quadratue encoder interface so it becomes i64 in stead of u32
+    use qei::QeiManager;
+
+    const PID_freq : u32 = 10;
 
     #[monotonic(binds = SysTick, default = true)]
     type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
@@ -35,9 +42,12 @@ mod app {
     struct Local {
         onboard_led: PC13<Output<PushPull>>,
         signal_led: PA2<Output<PushPull>>,
+//        motor_ch_1: PA0<Alternate<PushPull>>,
+//        motor_ch_2: PA1<Alternate<PushPull>>,
+        rate_switch: PA3<Input<PullUp>>,
         last_pos: i64,
         last_pos_change_time: i64,
-        tmr2: CountDownTimer<stm32::TIM2>,
+        tmr3: CountDownTimer<stm32::TIM3>,
     }
 
     #[init]
@@ -47,10 +57,12 @@ mod app {
 
         let mut flash = cx.device.FLASH.constrain();
         let rcc = cx.device.RCC.constrain();
+        // Prepare the alternate function I/O registers
+        let mut afio = cx.device.AFIO.constrain();
 
         // Acquire the GPIOC peripherals
         let mut gpioa = cx.device.GPIOA.split();
-        // let mut gpiob = dp.GPIOB.split(&mut rcc.apb2); // quadrature counter
+        let mut gpiob = cx.device.GPIOB.split(); // quadrature counter
         let mut gpioc = cx.device.GPIOC.split();
 
         let clocks = rcc
@@ -69,6 +81,7 @@ mod app {
         let mut signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
         signal_led.set_low();
 
+        // set up the timer
         let mono = DwtSystick::new(
             &mut cx.core.DCB,
             cx.core.DWT,
@@ -76,12 +89,57 @@ mod app {
             clocks.hclk().0,
         );
 
+        //      let mut motor_ch_1 = gpioa.pa0.into_alternate_push_pull(&mut gpioa.crl);
+        //      let mut motor_ch_2 = gpioa.pa1.into_alternate_push_pull(&mut gpioa.crl);
+
+        let pwm_pins = (
+            gpioa.pa0.into_alternate_push_pull(&mut gpioa.crl), // motor ch 1
+            gpioa.pa1.into_alternate_push_pull(&mut gpioa.crl)  // motor ch 2
+        );
+
+        // set up PWM
+        let pwm = Timer::tim2(cx.device.TIM2, &clocks).pwm::<Tim2NoRemap, _, _, _>(
+            pwm_pins,
+            &mut afio.mapr,
+            20.khz(),
+        );
+        let max_duty: f64 = pwm.get_max_duty() as f64;
+
+        let mut pwm_channels = pwm.split();
+
+        pwm_channels.0.enable();
+        pwm_channels.1.enable();
+
+        let mut pwm_backward = pwm_channels.0;
+        let mut pwm_forward = pwm_channels.1;
+
+        // Quadrature input section
+        // TIM4
+        // ensure pull up resistor in hall sensor circuit is physically present
+        // stm32f1xx_hal::pwm_input::Pins does not allow into_pull_up_input ?!
+
+        let qei_pins = (
+            gpiob.pb6.into_floating_input(&mut gpiob.crl),
+            gpiob.pb7.into_floating_input(&mut gpiob.crl),
+        );
+
+        let qei = Timer::tim4(cx.device.TIM4, &clocks).qei(
+            qei_pins,
+            &mut afio.mapr,
+            QeiOptions::default(),
+        );
+
+        let mut motor_pos = QeiManager::new(qei);
+
+        // control switch input. Pullup.
+        let rate_switch = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
+
         // app setup
 
         // Use TIM2 for the PID counter task
-        let mut tmr2 =
-            Timer::tim2(cx.device.TIM2, &clocks).start_count_down(4.hz());
-        tmr2.listen(Event::Update);
+        let mut tmr3 =
+            Timer::tim3(cx.device.TIM3, &clocks).start_count_down(PID_freq.hz());
+        tmr3.listen(Event::Update);
 
         //let tracking: bool = false;
 
@@ -100,7 +158,8 @@ mod app {
                 signal_led,
                 last_pos: 0,
                 last_pos_change_time: 0,
-                tmr2
+                tmr3,
+                rate_switch,
             },
             init::Monotonics(mono),
         )
@@ -143,13 +202,13 @@ mod app {
 
 
     // Interrupt task for TIM2, the PID counter timer
-    #[task(binds = TIM2, priority = 1, local = [tmr2])]
-    fn tim2(cx: tim2::Context) {
+    #[task(binds = TIM3, priority = 1, local = [tmr3])]
+    fn tim3(cx: tim3::Context) {
         // Delegate the state update to a software task
         pid_update::spawn().unwrap();
         // Restart the timer and clear the interrupt flag
-        cx.local.tmr2.start(4.hz());
-        cx.local.tmr2.clear_update_interrupt_flag();
+        cx.local.tmr3.start(PID_freq.hz());
+        cx.local.tmr3.clear_update_interrupt_flag();
     }
 
 
