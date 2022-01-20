@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 #![no_main]
 #![no_std]
 
@@ -14,6 +15,8 @@ mod app {
         gpio::{gpiob::{PB6,PB7}},
         gpio::{gpioc::{PC13}},
         prelude::*,
+        timer::{Event, Timer, CountDownTimer},
+        stm32,
     };
 
     #[monotonic(binds = SysTick, default = true)]
@@ -24,6 +27,8 @@ mod app {
     struct Shared {
         // TODO: Add resources
         tracking: bool, // is system in tracking state? if not: retracting
+        t: i64,         // discrete time in tenths of seconds
+        tmr2: CountDownTimer<stm32::TIM2>,
     }
 
     // Local resources go here
@@ -31,6 +36,8 @@ mod app {
     struct Local {
         onboard_led: PC13<Output<PushPull>>,
         signal_led: PA2<Output<PushPull>>,
+        last_pos: i64,
+        last_pos_change_time: i64,
     }
 
     #[init]
@@ -45,9 +52,15 @@ mod app {
         let mut gpioa = cx.device.GPIOA.split();
         // let mut gpiob = dp.GPIOB.split(&mut rcc.apb2); // quadrature counter
         let mut gpioc = cx.device.GPIOC.split();
+
         let clocks = rcc
             .cfgr
+            .use_hse(8.mhz())
             .sysclk(48.mhz())
+            .hclk(48.mhz())
+            .pclk1(8.mhz())
+            .pclk2(8.mhz())
+            .adcclk(8.mhz())
             .freeze(&mut flash.acr);
 
         // Set up the LED.
@@ -64,6 +77,12 @@ mod app {
         );
 
         // app setup
+
+        // Use TIM2 for the PID counter task
+        let mut tmr2 =
+            Timer::tim2(cx.device.TIM2, &clocks).start_count_down(800.hz());
+        tmr2.listen(Event::Update);
+
         //let tracking: bool = false;
 
         main::spawn_after(1.millis()).ok();
@@ -72,12 +91,16 @@ mod app {
         (
             Shared {
                 // Initialization of shared resources go here
-                tracking: false
+                tracking: false,
+                t: 0,
+                tmr2
             },
             Local {
                 // Initialization of local resources go here
                 onboard_led,
-                signal_led
+                signal_led,
+                last_pos: 0,
+                last_pos_change_time: 0,
             },
             init::Monotonics(mono),
         )
@@ -94,23 +117,26 @@ mod app {
 
     // TODO: Add tasks
     // &- means that shared resource is 'not locked'
-    #[task(shared=[tracking], local=[onboard_led,signal_led])]
-    fn main(mut cx: main::Context) {
+    #[task(shared=[tracking, t], local=[onboard_led,signal_led])]
+    fn main(cx: main::Context) {
         //defmt::info!("main!");
 
-        let mut tracking = cx.shared.tracking;
-        let mut onboard_led = cx.local.onboard_led;
-        let mut signal_led = cx.local.signal_led;
+        let tracking = cx.shared.tracking;
+        let t = cx.shared.t;
+        let onboard_led = cx.local.onboard_led;
+        let signal_led = cx.local.signal_led;
 
-        (tracking).lock(|tracking| {
+        (tracking, t).lock(|tracking, t| {
             if *tracking {
                 // track
                 *tracking = false;
+                *t += 5;
                 onboard_led.set_low();
                 signal_led.set_high();
             } else {
                 // retract and check if we are stalling
                 *tracking = true;
+                *t += 5;
                 onboard_led.set_high();
                 signal_led.set_low();
             }
