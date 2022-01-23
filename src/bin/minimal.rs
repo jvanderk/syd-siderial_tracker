@@ -2,11 +2,16 @@
 #![no_main]
 #![no_std]
 
+use defmt_rtt as _;    // transport layer for defmt logs
+
 use syd as _; // global logger + panicking-behavior + memory layout
 
 
 #[rtic::app(device =  stm32f1xx_hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
+
+    //use core::marker::PhantomData;
+    use stm32f1xx_hal::spi::Remap;
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
 
@@ -16,15 +21,15 @@ mod app {
         gpio::{gpiob::{PB6,PB7}},
         gpio::{gpioc::{PC13}},
         prelude::*,
-        timer::{Event, Timer, CountDownTimer,Tim2NoRemap},
+        timer::{Event, Timer, CountDownTimer,Tim2NoRemap,Tim4NoRemap},
         stm32,
-        qei::QeiOptions,
+        qei::{Qei, QeiOptions},
     };
 
     // wrapper around quadratue encoder interface so it becomes i64 in stead of u32
     use qei::QeiManager;
 
-    const PID_freq : u32 = 10;
+    const PID_freq : u32 = 50;
 
     #[monotonic(binds = SysTick, default = true)]
     type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
@@ -34,6 +39,7 @@ mod app {
     struct Shared {
         // TODO: Add resources
         tracking: bool, // is system in tracking state? if not: retracting
+        setpoint: i64,  // target position for digital servo
         t: i64,         // discrete time in tenths of seconds
     }
 
@@ -42,18 +48,21 @@ mod app {
     struct Local {
         onboard_led: PC13<Output<PushPull>>,
         signal_led: PA2<Output<PushPull>>,
-//        motor_ch_1: PA0<Alternate<PushPull>>,
-//        motor_ch_2: PA1<Alternate<PushPull>>,
         rate_switch: PA3<Input<PullUp>>,
         last_pos: i64,
         last_pos_change_time: i64,
         tmr3: CountDownTimer<stm32::TIM3>,
+        motor_pos: QeiManager<Qei<stm32::TIM4, Tim4NoRemap,
+//                                  Remap<Periph = stm32::TIM4>,
+                                  (PB6<Input<Floating>>,PB7<Input<Floating>>)
+                                  >
+                              >,
     }
 
     #[init]
     fn init(mut cx: init::Context) -> (Shared, Local, init::Monotonics) {
 
-        defmt::info!("init");
+        defmt::println!("init");
 
         let mut flash = cx.device.FLASH.constrain();
         let rcc = cx.device.RCC.constrain();
@@ -67,12 +76,12 @@ mod app {
 
         let clocks = rcc
             .cfgr
-            .use_hse(8.mhz())
+            //.use_hse(8.mhz()) // use internal clock since xtal on board seems to be broken.
             .sysclk(48.mhz())
-            .hclk(48.mhz())
-            .pclk1(8.mhz())
-            .pclk2(8.mhz())
-            .adcclk(8.mhz())
+            .hclk(32.mhz())
+            .pclk1(36.mhz())
+            .pclk2(36.mhz())
+            .adcclk(4.mhz())
             .freeze(&mut flash.acr);
 
         // Set up the LED.
@@ -150,6 +159,7 @@ mod app {
             Shared {
                 // Initialization of shared resources go here
                 tracking: false,
+                setpoint: -i64::MAX, // initial setpoint minus infinite
                 t: 0
             },
             Local {
@@ -160,6 +170,7 @@ mod app {
                 last_pos_change_time: 0,
                 tmr3,
                 rate_switch,
+                motor_pos,
             },
             init::Monotonics(mono),
         )
@@ -178,7 +189,7 @@ mod app {
     // &- means that shared resource is 'not locked'
     #[task(shared=[tracking, t], local=[signal_led])]
     fn main(cx: main::Context) {
-        //defmt::info!("main!");
+        defmt::info!("main!");
 
         let tracking = cx.shared.tracking;
         let t = cx.shared.t;
@@ -202,7 +213,7 @@ mod app {
 
 
     // Interrupt task for TIM2, the PID counter timer
-    #[task(binds = TIM3, priority = 1, local = [tmr3])]
+    #[task(binds = TIM3, priority = 2, local = [tmr3])]
     fn tim3(cx: tim3::Context) {
         // Delegate the state update to a software task
         pid_update::spawn().unwrap();
@@ -212,14 +223,19 @@ mod app {
     }
 
 
-    // update the PID loop
-    #[task(shared = [t], local = [onboard_led])]
+    // update the PID loop; skeleton
+    // with help from henrik_alser
+    #[task(shared = [t, setpoint], local = [onboard_led, motor_pos])]
     fn pid_update(cx: pid_update::Context) {
         let onboard_led = cx.local.onboard_led;
         let mut t = cx.shared.t;
-        t.lock(|t| {
+        let mut setpoint = cx.shared.setpoint;
+        let mut motor_pos = cx.local.motor_pos;
+        (setpoint, t).lock(|setpoint, t| {
             *t += 1;
             onboard_led.toggle();
+            motor_pos.sample().unwrap();
+            let position_error = *setpoint - motor_pos.count();
         })
     }
 
