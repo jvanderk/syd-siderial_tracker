@@ -12,6 +12,8 @@ mod app {
 
     //use core::marker::PhantomData;
     use stm32f1xx_hal::spi::Remap;
+    use stm32f1xx_hal::pwm::Pwm;
+    use stm32f1xx_hal::gpio::CRL;
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
 
@@ -51,12 +53,21 @@ mod app {
         rate_switch: PA3<Input<PullUp>>,
         last_pos: i64,
         last_pos_change_time: i64,
+
         tmr3: CountDownTimer<stm32::TIM3>,
         motor_pos: QeiManager<Qei<stm32::TIM4, Tim4NoRemap,
-//                                  Remap<Periph = stm32::TIM4>,
                                   (PB6<Input<Floating>>,PB7<Input<Floating>>)
                                   >
                               >,
+        error_prior: f64,
+        integral_prior: f64,
+
+        pwm: Pwm<stm32f1xx_hal::pac::TIM2, Tim2NoRemap,
+                 (stm32f1xx_hal::pwm::C1, stm32f1xx_hal::pwm::C2),
+                 (stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 0_u8>,
+                  stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 1_u8>)
+                 >,
+        // Timer<stm32::TIM2<Tim2NoRemap, _, _, _>>,
     }
 
     #[init]
@@ -112,15 +123,6 @@ mod app {
             &mut afio.mapr,
             20.khz(),
         );
-        let max_duty: f64 = pwm.get_max_duty() as f64;
-
-        let mut pwm_channels = pwm.split();
-
-        pwm_channels.0.enable();
-        pwm_channels.1.enable();
-
-        let mut pwm_backward = pwm_channels.0;
-        let mut pwm_forward = pwm_channels.1;
 
         // Quadrature input section
         // TIM4
@@ -171,6 +173,9 @@ mod app {
                 tmr3,
                 rate_switch,
                 motor_pos,
+                integral_prior: 0.0,
+                error_prior: 0.0,
+                pwm,
             },
             init::Monotonics(mono),
         )
@@ -225,17 +230,61 @@ mod app {
 
     // update the PID loop; skeleton
     // with help from henrik_alser
-    #[task(shared = [t, setpoint], local = [onboard_led, motor_pos])]
+    #[task(shared = [t, setpoint], local = [onboard_led, motor_pos,
+                                            integral_prior, error_prior,
+                                            pwm])]
     fn pid_update(cx: pid_update::Context) {
         let onboard_led = cx.local.onboard_led;
         let mut t = cx.shared.t;
         let mut setpoint = cx.shared.setpoint;
         let mut motor_pos = cx.local.motor_pos;
+        let mut integral_prior = cx.local.integral_prior;
+        let mut error_prior = cx.local.error_prior;
+        let pwm = cx.local.pwm;
+
+        let max_duty: f64 = pwm.get_max_duty() as f64;
+
+        let mut pwm_channels = pwm.split();
+
+        pwm_channels.0.enable();
+        pwm_channels.1.enable();
+
+        let mut pwm_backward = pwm_channels.0;
+        let mut pwm_forward = pwm_channels.1;
+
+        let Kp: f64 = 16.0;
+	let Ki: f64 = 0.0;
+	let Kd: f64 = 1.0;
+	let bias: f64 = max_duty / 5.0;
+
         (setpoint, t).lock(|setpoint, t| {
             *t += 1;
             onboard_led.toggle();
             motor_pos.sample().unwrap();
-            let position_error = *setpoint - motor_pos.count();
+            let position_error: f64 = (*setpoint - motor_pos.count())as f64;
+
+            // pid control
+	    let bias: f64 = max_duty / 5.0;
+            let integral = *integral_prior + position_error as f64  / PID_freq as f64;
+	    let derivative = (position_error - *error_prior) * PID_freq as f64;
+	    let mut pwm_setting = Kp * position_error + Ki * integral + Kd*derivative + bias;
+
+            *integral_prior = integral;
+            *error_prior = position_error;
+
+            if pwm_setting > max_duty  {
+                pwm_setting = max_duty ;
+            };
+
+	    // set pwm
+            if pwm_setting > 0.0 {
+                pwm_forward.set_duty(pwm_setting as u16);
+		pwm_backward.set_duty(0);
+            } else {
+                pwm_forward.set_duty(0);
+		pwm_backward.set_duty(0*-pwm_setting as u16);
+            };
+
         })
     }
 
