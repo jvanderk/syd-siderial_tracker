@@ -14,6 +14,7 @@ mod app {
     use stm32f1xx_hal::spi::Remap;
     use stm32f1xx_hal::pwm::Pwm;
     use stm32f1xx_hal::gpio::CRL;
+    use stm32f1xx_hal::pwm::PwmChannel;
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
 
@@ -62,11 +63,15 @@ mod app {
         error_prior: f64,
         integral_prior: f64,
 
-        pwm: Pwm<stm32f1xx_hal::pac::TIM2, Tim2NoRemap,
-                 (stm32f1xx_hal::pwm::C1, stm32f1xx_hal::pwm::C2),
-                 (stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 0_u8>,
-                  stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 1_u8>)
-                 >,
+        pwm_backward: PwmChannel<stm32f1xx_hal::pac::TIM2, stm32f1xx_hal::pwm::C1>,
+        pwm_forward: PwmChannel<stm32f1xx_hal::pac::TIM2, stm32f1xx_hal::pwm::C2>,
+        pwm_max_duty: u16,
+
+        // pwm: Pwm<stm32f1xx_hal::pac::TIM2, Tim2NoRemap,
+        //          (stm32f1xx_hal::pwm::C1, stm32f1xx_hal::pwm::C2),
+        //          (stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 0_u8>,
+        //           stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 1_u8>)
+        //          >,
         // Timer<stm32::TIM2<Tim2NoRemap, _, _, _>>,
     }
 
@@ -124,6 +129,17 @@ mod app {
             20.khz(),
         );
 
+        let max_duty = pwm.get_max_duty();
+
+        let mut pwm_channels = pwm.split();
+
+        pwm_channels.0.enable();
+        pwm_channels.1.enable();
+
+        let mut pwm_backward = pwm_channels.0;
+        let mut pwm_forward = pwm_channels.1;
+
+
         // Quadrature input section
         // TIM4
         // ensure pull up resistor in hall sensor circuit is physically present
@@ -175,7 +191,9 @@ mod app {
                 motor_pos,
                 integral_prior: 0.0,
                 error_prior: 0.0,
-                pwm,
+                pwm_backward: pwm_backward,
+                pwm_forward: pwm_forward,
+                pwm_max_duty: max_duty,
             },
             init::Monotonics(mono),
         )
@@ -232,7 +250,7 @@ mod app {
     // with help from henrik_alser
     #[task(shared = [t, setpoint], local = [onboard_led, motor_pos,
                                             integral_prior, error_prior,
-                                            pwm])]
+                                            pwm_backward, pwm_forward, pwm_max_duty])]
     fn pid_update(cx: pid_update::Context) {
         let onboard_led = cx.local.onboard_led;
         let mut t = cx.shared.t;
@@ -240,22 +258,14 @@ mod app {
         let mut motor_pos = cx.local.motor_pos;
         let mut integral_prior = cx.local.integral_prior;
         let mut error_prior = cx.local.error_prior;
-        let pwm = cx.local.pwm;
-
-        let max_duty: f64 = pwm.get_max_duty() as f64;
-
-        let mut pwm_channels = pwm.split();
-
-        pwm_channels.0.enable();
-        pwm_channels.1.enable();
-
-        let mut pwm_backward = pwm_channels.0;
-        let mut pwm_forward = pwm_channels.1;
+        let pwm_forward = cx.local.pwm_forward;
+        let pwm_backward = cx.local.pwm_backward;
+        let pwm_max_duty = cx.local.pwm_max_duty;
 
         let Kp: f64 = 16.0;
 	let Ki: f64 = 0.0;
 	let Kd: f64 = 1.0;
-	let bias: f64 = max_duty / 5.0;
+	let bias: f64 = *pwm_max_duty as f64 / 5.0;
 
         (setpoint, t).lock(|setpoint, t| {
             *t += 1;
@@ -264,7 +274,6 @@ mod app {
             let position_error: f64 = (*setpoint - motor_pos.count())as f64;
 
             // pid control
-	    let bias: f64 = max_duty / 5.0;
             let integral = *integral_prior + position_error as f64  / PID_freq as f64;
 	    let derivative = (position_error - *error_prior) * PID_freq as f64;
 	    let mut pwm_setting = Kp * position_error + Ki * integral + Kd*derivative + bias;
@@ -272,8 +281,8 @@ mod app {
             *integral_prior = integral;
             *error_prior = position_error;
 
-            if pwm_setting > max_duty  {
-                pwm_setting = max_duty ;
+            if pwm_setting > (*pwm_max_duty).into()  {
+                pwm_setting = (*pwm_max_duty).into() ;
             };
 
 	    // set pwm
@@ -282,7 +291,7 @@ mod app {
 		pwm_backward.set_duty(0);
             } else {
                 pwm_forward.set_duty(0);
-		pwm_backward.set_duty(0*-pwm_setting as u16);
+		pwm_backward.set_duty(-pwm_setting as u16);
             };
 
         })
