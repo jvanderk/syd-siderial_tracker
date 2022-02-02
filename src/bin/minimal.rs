@@ -16,6 +16,8 @@ mod app {
     use stm32f1xx_hal::spi::Remap;
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
+    use fugit::*;
+
 
     use stm32f1xx_hal::{
         gpio::gpiob::{PB6, PB7},
@@ -163,7 +165,7 @@ mod app {
 
         //let tracking: bool = false;
 
-        main::spawn_after(1.millis()).ok();
+        main::spawn_after(ExtU32::millis(1)).ok();
 
         // return the resources (and the monotonic timer?)
         (
@@ -206,26 +208,19 @@ mod app {
     // &- means that shared resource is 'not locked'
     #[task(shared=[tracking, t], local=[signal_led])]
     fn main(cx: main::Context) {
-        defmt::info!("main!");
+        let dt: u32 = 100;
+        let mut tracking = cx.shared.tracking;
 
-        let tracking = cx.shared.tracking;
-        let t = cx.shared.t;
         let signal_led = cx.local.signal_led;
+        signal_led.toggle();
 
-        (tracking, t).lock(|tracking, t| {
-            if *tracking {
-                // track
-                *tracking = false;
-                *t += 5;
-                signal_led.set_high();
-            } else {
-                // retract and check if we are stalling
-                *tracking = true;
-                *t += 5;
-                signal_led.set_low();
-            }
+        // this is a bad way of finding time in seconds
+        defmt::println!("main! {}", monotonics::now().ticks()/48_000_000);
+
+        (tracking).lock(|tracking| {
+            ;
         });
-        main::spawn_after(500.millis()).ok();
+        main::spawn_after(ExtU32::millis(dt)).ok();
     }
 
     // Interrupt task for TIM2, the PID counter timer
@@ -270,7 +265,6 @@ mod app {
         let bias: f64 = *pwm_max_duty as f64 / 5.0;
 
         (setpoint, t, tracking).lock(|setpoint, t, tracking| {
-            *t += 1;
             onboard_led.toggle();
 
             // get position of motor
@@ -288,6 +282,7 @@ mod app {
             if (*t_last_position_change - *t) > 5 {
                 // more than x seconds passed since last position change:
                 // stalled
+                defmt::println!("stalled");
                 if *tracking {
                     // stalled and tracking: have to retract
                     *setpoint = -i64::MAX;
