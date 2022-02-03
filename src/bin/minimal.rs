@@ -10,13 +10,13 @@ use syd as _; // global logger + panicking-behavior + memory layout
 mod app {
 
     //use core::marker::PhantomData;
-    use stm32f1xx_hal::gpio::CRL;
-    use stm32f1xx_hal::pwm::Pwm;
+//    use stm32f1xx_hal::gpio::CRL;
+//    use stm32f1xx_hal::pwm::Pwm;
     use stm32f1xx_hal::pwm::PwmChannel;
-    use stm32f1xx_hal::spi::Remap;
+//    use stm32f1xx_hal::spi::Remap;
 
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
-    use fugit::*;
+//    use fugit::*;
 
 
     use stm32f1xx_hal::{
@@ -24,8 +24,11 @@ mod app {
         gpio::gpioc::PC13,
         gpio::{gpioa::PA3, Floating, Input, PullUp},
         gpio::{
-            gpioa::{PA0, PA1, PA2},
-            Alternate, Output, PushPull,
+            gpioa::{
+//                PA0, PA1,
+                PA2},
+//            Alternate,
+            Output, PushPull,
         },
         prelude::*,
         qei::{Qei, QeiOptions},
@@ -47,7 +50,11 @@ mod app {
         // TODO: Add resources
         tracking: bool, // is system in tracking state? if not: retracting
         setpoint: i64,  // target position for digital servo
-        t: i64,         // discrete time in tenths of seconds
+        epoch: i64,         // discrete time in tenths of seconds
+        motor_pos:
+            QeiManager<Qei<stm32::TIM4, Tim4NoRemap, (PB6<Input<Floating>>, PB7<Input<Floating>>)>>,
+        last_position: i64,
+        t_last_position_change: i64,
     }
 
     // Local resources go here
@@ -58,8 +65,6 @@ mod app {
         rate_switch: PA3<Input<PullUp>>,
 
         tmr3: CountDownTimer<stm32::TIM3>,
-        motor_pos:
-            QeiManager<Qei<stm32::TIM4, Tim4NoRemap, (PB6<Input<Floating>>, PB7<Input<Floating>>)>>,
         error_prior: f64,
         integral_prior: f64,
 
@@ -67,9 +72,6 @@ mod app {
         pwm_forward: PwmChannel<stm32f1xx_hal::pac::TIM2, stm32f1xx_hal::pwm::C2>,
         pwm_max_duty: u16,
 
-        last_position: i64,
-        t_last_position_change: i64,
-        t_start_run: i64,
         // pwm: Pwm<stm32f1xx_hal::pac::TIM2, Tim2NoRemap,
         //          (stm32f1xx_hal::pwm::C1, stm32f1xx_hal::pwm::C2),
         //          (stm32f1xx_hal::gpio::Pin<Alternate<stm32f1xx_hal::gpio::PushPull>, CRL, 'A', 0_u8>,
@@ -102,24 +104,24 @@ mod app {
             .adcclk(4.mhz())
             .freeze(&mut flash.acr);
 
-        // Set up the LED.
+        // Set up the LED
         let mut onboard_led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
         onboard_led.set_high(); // not sure why unwrap is not implemented.
+
+        // set up signal LED on PA2
         let mut signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
         signal_led.set_low();
 
-        // set up the timer
+        // set up system timer
         let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, clocks.hclk().0);
 
-        //      let mut motor_ch_1 = gpioa.pa0.into_alternate_push_pull(&mut gpioa.crl);
-        //      let mut motor_ch_2 = gpioa.pa1.into_alternate_push_pull(&mut gpioa.crl);
-
+        //------------
+        // set up PWM
         let pwm_pins = (
             gpioa.pa0.into_alternate_push_pull(&mut gpioa.crl), // motor ch 1
             gpioa.pa1.into_alternate_push_pull(&mut gpioa.crl), // motor ch 2
         );
 
-        // set up PWM
         let pwm = Timer::tim2(cx.device.TIM2, &clocks).pwm::<Tim2NoRemap, _, _, _>(
             pwm_pins,
             &mut afio.mapr,
@@ -136,10 +138,11 @@ mod app {
         let mut pwm_backward = pwm_channels.0;
         let mut pwm_forward = pwm_channels.1;
 
-        // Quadrature input section
-        // TIM4
-        // ensure pull up resistor in hall sensor circuit is physically present
-        // stm32f1xx_hal::pwm_input::Pins does not allow into_pull_up_input ?!
+        //------------
+        // set up quadrature angle counter
+        // use TIM4 as the qei counter
+        // ! ensure a pull up resistor in hall sensor circuit is physically present
+        // ! stm32f1xx_hal::pwm_input::Pins does not allow into_pull_up_input ?!
 
         let qei_pins = (
             gpiob.pb6.into_floating_input(&mut gpiob.crl),
@@ -154,26 +157,29 @@ mod app {
 
         let mut motor_pos = QeiManager::new(qei);
 
-        // control switch input. Pullup.
+        //------------
+        // tracking rate selection control switch input Pullup.
         let rate_switch = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
 
-        // app setup
-
-        // Use TIM2 for the PID counter task
+        //------------
+        // Use TIM2 for the PID controller task
         let mut tmr3 = Timer::tim3(cx.device.TIM3, &clocks).start_count_down(PID_freq.hz());
         tmr3.listen(Event::Update);
 
-        //let tracking: bool = false;
+        //------------
+        // kick off the main thread
+        main::spawn().ok();
 
-        main::spawn_after(ExtU32::millis(1)).ok();
-
-        // return the resources (and the monotonic timer?)
+        // return the resources (and the monotonic timer)
         (
             Shared {
                 // Initialization of shared resources go here
                 tracking: false,
                 setpoint: -i64::MAX, // initial setpoint minus infinite
-                t: 0,
+                epoch: 0,
+                motor_pos,
+                last_position: 0,
+                t_last_position_change: 0,
             },
             Local {
                 // Initialization of local resources go here
@@ -181,15 +187,11 @@ mod app {
                 signal_led,
                 tmr3,
                 rate_switch,
-                motor_pos,
                 integral_prior: 0.0,
                 error_prior: 0.0,
                 pwm_backward: pwm_backward,
                 pwm_forward: pwm_forward,
                 pwm_max_duty: max_duty,
-                last_position: 0,
-                t_last_position_change: 0,
-                t_start_run: 0,
             },
             init::Monotonics(mono),
         )
@@ -206,21 +208,66 @@ mod app {
 
     // TODO: Add tasks
     // &- means that shared resource is 'not locked'
-    #[task(shared=[tracking, t], local=[signal_led])]
+    #[task(
+        shared=[epoch,tracking,motor_pos,setpoint,last_position,t_last_position_change],
+        local=[signal_led],
+    )]
     fn main(cx: main::Context) {
-        let dt: u32 = 100;
+
         let mut tracking = cx.shared.tracking;
+        let mut motor_pos = cx.shared.motor_pos;
+        let mut epoch = cx.shared.epoch;
+        let mut last_position = cx.shared.last_position;
+        let mut t_last_position_change = cx.shared.t_last_position_change;
+        let mut setpoint = cx.shared.setpoint;
 
         let signal_led = cx.local.signal_led;
         signal_led.toggle();
 
+        let t = as_s(monotonics::now().duration_since_epoch());
+
         // this is a bad way of finding time in seconds
         defmt::println!("main! {}", monotonics::now().ticks()/48_000_000);
 
-        (tracking).lock(|tracking| {
-            ;
+        (epoch,tracking,motor_pos,setpoint,last_position,t_last_position_change)
+            .lock(|epoch,tracking,motor_pos,setpoint,last_position,t_last_position_change| {
+                // get position of motor
+                motor_pos.sample().unwrap();
+                let position = motor_pos.count();
+//                let position_error: f64 = (*setpoint - position) as f64;
+
+                // check if motor is stalled; assume we are always moving at second scale
+                // if stalled, decide what to do next
+
+                if position != *last_position {
+                    *t_last_position_change = t;
+                }
+
+                *last_position = position;
+
+                defmt::println!("last position {}", *last_position);
+                defmt::println!("last t_last_position_change {}", *t_last_position_change);
+                defmt::println!("dt {}", (t-*t_last_position_change));
+                defmt::println!("setpoint {}", *setpoint);
+                if (t - *t_last_position_change) > 3 {
+                    // more than x seconds passed since last position change:
+                    // stalled
+                    defmt::println!("stalled");
+                    if *tracking {
+                        // stalled and tracking: have to retract
+                        *setpoint = -i64::MAX;
+                        *tracking = false;
+                    } else {
+                        // stalled and not trackingwe just retracted: start tracking
+                        *tracking = true;
+                        *epoch = t; // start time of this run
+                    }
+                }
+                if *tracking {
+                    *setpoint = i64::MAX;
+                }
         });
-        main::spawn_after(ExtU32::millis(dt)).ok();
+        main::spawn_after(ExtU32::millis(1000u32)).ok();
     }
 
     // Interrupt task for TIM2, the PID counter timer
@@ -235,26 +282,30 @@ mod app {
 
     // update the PID loop; skeleton
     // with help from henrik_alser and adamgreig
-    #[task(shared = [t, setpoint, tracking],
-           local = [onboard_led,
-                    motor_pos, // qei object
-                    last_position, t_last_position_change, // stall check data
-                    t_start_run,
-                    integral_prior, error_prior, // PID parameters
-                    pwm_backward, pwm_forward, // pwm channels
-                    pwm_max_duty, // constant
-           ])]
+    #[task(
+        shared = [epoch,     // start time of run
+                  setpoint,  // setpoint position
+                  tracking,  // bool: are we tracking?
+                  motor_pos, // qei encoder
+                  last_position, t_last_position_change, // stall check data
+        ],
+        local = [onboard_led,
+                 integral_prior, error_prior, // PID parameters
+                 pwm_backward, pwm_forward, // pwm channels
+                 pwm_max_duty, // constant
+        ]
+    )]
     fn pid_update(cx: pid_update::Context) {
+
         let onboard_led = cx.local.onboard_led;
-        let mut t = cx.shared.t;
+
         let mut tracking = cx.shared.tracking;
-        let mut last_position = cx.local.last_position;
-        let mut t_last_position_change = cx.local.t_last_position_change;
         let mut setpoint = cx.shared.setpoint;
-        let mut t_start_run = cx.local.t_start_run;
-        let mut motor_pos = cx.local.motor_pos;
+        let mut motor_pos = cx.shared.motor_pos;
+
         let mut integral_prior = cx.local.integral_prior;
         let mut error_prior = cx.local.error_prior;
+
         let pwm_forward = cx.local.pwm_forward;
         let pwm_backward = cx.local.pwm_backward;
         let pwm_max_duty = cx.local.pwm_max_duty;
@@ -264,35 +315,15 @@ mod app {
         let Kd: f64 = 1.0;
         let bias: f64 = *pwm_max_duty as f64 / 5.0;
 
-        (setpoint, t, tracking).lock(|setpoint, t, tracking| {
+        let t = as_s(monotonics::now().duration_since_epoch());
+
+        (setpoint, tracking, motor_pos).lock(|setpoint, tracking, motor_pos| {
             onboard_led.toggle();
 
             // get position of motor
             motor_pos.sample().unwrap();
             let position = motor_pos.count();
-            let position_error: f64 = (*setpoint - position) as f64;
-
-            // check if motor is stalled; assume we are always moving at second scale
-            // if stalled, decide what to do next
-
-            if position != *last_position {
-                *t_last_position_change = *t;
-            }
-
-            if (*t_last_position_change - *t) > 5 {
-                // more than x seconds passed since last position change:
-                // stalled
-                defmt::println!("stalled");
-                if *tracking {
-                    // stalled and tracking: have to retract
-                    *setpoint = -i64::MAX;
-                    *tracking = false;
-                } else {
-                    // stalled and not tracking: start tracking
-                    *tracking = true;
-                    *t_start_run = *t; // start time of this run
-                }
-            }
+            let position_error: f64 = *setpoint as f64 - position as f64;
 
             // pid control
             let integral = *integral_prior + position_error as f64 / PID_freq as f64;
@@ -315,5 +346,17 @@ mod app {
                 pwm_backward.set_duty(-pwm_setting as u16);
             };
         })
+    }
+
+//    fn as_s (dt: dwt_systick_monotonic::fugit::Duration<u32, 1, 48_000_000>) -> i64 {
+//        (dt.ticks()/48_000_000) as i64
+//    }
+
+    fn as_s<const NOM: u32, const DENOM: u32>(
+        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
+    ) -> i64
+    {
+        let secs: dwt_systick_monotonic::fugit::SecsDurationU32 = d.convert();
+        secs.ticks() as i64
     }
 }
