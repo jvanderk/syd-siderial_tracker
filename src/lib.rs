@@ -7,7 +7,6 @@ use defmt_rtt as _; // global logger
 // use some_hal as _; // memory layout
 use stm32f1xx_hal as _;
 
-
 use panic_probe as _;
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
@@ -31,3 +30,5 @@ pub fn exit() -> ! {
         cortex_m::asm::bkpt();
     }
 }
+
+pub mod mono;

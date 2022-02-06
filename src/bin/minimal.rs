@@ -2,6 +2,14 @@
 #![no_main]
 #![no_std]
 
+
+// Mapping
+// TIM1
+// TIM2
+// TIM3
+// TIM4
+
+
 use defmt_rtt as _; // transport layer for defmt logs
 
 use syd as _; // global logger + panicking-behavior + memory layout
@@ -11,8 +19,8 @@ mod app {
 
     use stm32f1xx_hal::pwm::PwmChannel;
 
-    use dwt_systick_monotonic::{DwtSystick, ExtU32};
-
+//    use dwt_systick_monotonic::{DwtSystick, ExtU32};
+    use syd::mono::{ExtU32, MonoTimer};
 
     use stm32f1xx_hal::{
         gpio::gpiob::{PB6, PB7},
@@ -28,6 +36,8 @@ mod app {
         prelude::*,
         qei::{Qei, QeiOptions},
         stm32,
+        pac,
+//        time::MonoTimer,
         timer::{CountDownTimer, Event, Tim2NoRemap, Tim4NoRemap, Timer},
     };
 
@@ -36,9 +46,12 @@ mod app {
 
     const PID_freq: u32 = 800;
 
-    #[monotonic(binds = SysTick, default = true)]
-    //type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
-    type MonoTimer = DwtSystick<48_000_000>;
+    #[monotonic(binds = TIM2, default = true)]
+    type MyMono = MonoTimer<pac::TIM2, 1_000>;
+
+    // #[monotonic(binds = SysTick, default = true)]
+    // type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
+    //type MonoTimer = DwtSystick<10_000>;
 
     // Shared resources go here
     #[shared]
@@ -102,7 +115,10 @@ mod app {
         signal_led.set_low();
 
         // set up system timer
-        let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, clocks.hclk().0);
+        let mono = MyMono::new(cx.device.TIM2, &clocks);
+
+        //let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, clocks.hclk().0);
+        //let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, 10_000u32);
 
         //------------
         // set up PWM
@@ -116,6 +132,7 @@ mod app {
             &mut afio.mapr,
             20.khz(),
         );
+
 
         let max_duty = pwm.get_max_duty();
 
@@ -144,14 +161,14 @@ mod app {
             QeiOptions::default(),
         );
 
-        let motor_pos = QeiManager::new(qei);
+        let mut motor_pos = QeiManager::new(qei);
 
         //------------
         // tracking rate selection control switch input Pullup.
         let rate_switch = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
 
         //------------
-        // Use TIM2 for the PID controller task
+        // Use TIM3 for the PID controller task
         let mut tmr3 = Timer::tim3(cx.device.TIM3, &clocks).start_count_down(PID_freq.hz());
         tmr3.listen(Event::Update);
 
@@ -198,22 +215,23 @@ mod app {
     // TODO: Add tasks
     // &- means that shared resource is 'not locked'
     #[task(
-        shared=[tracking,motor_pos,setpoint],
-        local=[epoch, signal_led,last_position,t_last_position_change],
+        shared=[tracking, motor_pos, setpoint],
+        local=[epoch, signal_led, last_position, t_last_position_change],
     )]
     fn main(cx: main::Context) {
 
-        let tracking = cx.shared.tracking;
-        let motor_pos = cx.shared.motor_pos;
-        let epoch = cx.local.epoch;
-        let last_position = cx.local.last_position;
-        let t_last_position_change = cx.local.t_last_position_change;
-        let setpoint = cx.shared.setpoint;
+        let mut tracking = cx.shared.tracking;
+        let mut motor_pos = cx.shared.motor_pos;
+        let mut epoch = cx.local.epoch;
+        let mut last_position = cx.local.last_position;
+        let mut t_last_position_change = cx.local.t_last_position_change;
+        let mut setpoint = cx.shared.setpoint;
 
         let signal_led = cx.local.signal_led;
         signal_led.toggle();
 
-        let t = as_s(monotonics::now().duration_since_epoch());
+//        let t = as_s(monotonics::now().duration_since_epoch());
+        let t = as_s(monotonics::now());
 
         // 1.08 deler compenseert voor foute klok?
 
@@ -243,8 +261,8 @@ mod app {
               )
             )) as i64;
 
-        (tracking,motor_pos,setpoint)
-            .lock(|tracking,motor_pos,setpoint| {
+        (tracking, motor_pos, setpoint)
+            .lock(|tracking, motor_pos, setpoint| {
                 // get position of motor
                 motor_pos.sample().unwrap();
                 let position = motor_pos.count();
@@ -322,10 +340,10 @@ mod app {
         let pwm_backward = cx.local.pwm_backward;
         let pwm_max_duty = cx.local.pwm_max_duty;
 
-        let Kp: f64 = 32.0;
+        let Kp: f64 = 2.* 32.0;
         let Ki: f64 = 0.0;
-        let Kd: f64 = 1.0;
-        let bias: f64 = *pwm_max_duty as f64 / 5.0;
+        let Kd: f64 = 2.0;
+        let bias: f64 = *pwm_max_duty as f64 / 100.0;
 
         (setpoint, motor_pos).lock(|setpoint, motor_pos| {
             onboard_led.toggle();
@@ -358,15 +376,15 @@ mod app {
         })
     }
 
-//    fn as_s (dt: dwt_systick_monotonic::fugit::Duration<u32, 1, 48_000_000>) -> i64 {
-//        (dt.ticks()/48_000_000) as i64
-//    }
-
-    fn as_s<const NOM: u32, const DENOM: u32>(
-        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
-    ) -> i64
-    {
-        let secs: dwt_systick_monotonic::fugit::SecsDurationU32 = d.convert();
-        secs.ticks() as i64
+    fn as_s (dt: dwt_systick_monotonic::fugit::Instant<u32, 1, 1_000>) -> i64 {
+        (dt.ticks()/48_000_000) as i64
     }
+
+//     fn as_s<const NOM: u32, const DENOM: u32>(
+//         d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
+//     ) -> i64
+//     {
+//         let secs: dwt_systick_monotonic::fugit::SecsDurationU32 = d.convert();
+//         secs.ticks() as i64
+//     }
 }
