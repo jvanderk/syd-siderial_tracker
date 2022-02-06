@@ -5,7 +5,7 @@ use core::convert::TryInto;
 pub use fugit::{self, ExtU32};
 use rtic_monotonic::Monotonic;
 use stm32f1xx_hal::{
-    pac::{RCC, TIM2},
+    pac::{RCC, TIM3},
     rcc::Clocks,
 };
 
@@ -14,12 +14,12 @@ pub struct MonoTimer<T, const FREQ: u32> {
     ovf: u32,
 }
 
-impl<const FREQ: u32> MonoTimer<TIM2, FREQ> {
-    pub fn new(tim: TIM2, clk: &Clocks) -> Self {
+impl<const FREQ: u32> MonoTimer<TIM3, FREQ> {
+    pub fn new(tim: TIM3, clk: &Clocks) -> Self {
         let rcc = unsafe { &(*RCC::ptr()) };
-        rcc.apb1enr.modify(|_, w| w.tim2en().set_bit());
-        rcc.apb1rstr.modify(|_, w| w.tim2rst().set_bit());
-        rcc.apb1rstr.modify(|_, w| w.tim2rst().clear_bit());
+        rcc.apb1enr.modify(|_, w| w.tim3en().set_bit());
+        rcc.apb1rstr.modify(|_, w| w.tim3rst().set_bit());
+        rcc.apb1rstr.modify(|_, w| w.tim3rst().clear_bit());
 
         // Configure timer.  If the u16 conversion panics, try increasing FREQ.
         let psc: u16 = (clk.pclk1_tim().0 / FREQ - 1).try_into().unwrap();
@@ -42,7 +42,7 @@ impl<const FREQ: u32> MonoTimer<TIM2, FREQ> {
     }
 }
 
-impl<const FREQ: u32> Monotonic for MonoTimer<TIM2, FREQ> {
+impl<const FREQ: u32> Monotonic for MonoTimer<TIM3, FREQ> {
     type Instant = fugit::TimerInstantU32<FREQ>;
     type Duration = fugit::TimerDurationU32<FREQ>;
 

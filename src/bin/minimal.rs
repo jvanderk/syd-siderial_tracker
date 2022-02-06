@@ -4,11 +4,13 @@
 
 
 // Mapping
-// TIM1
-// TIM2
-// TIM3
-// TIM4
+// list of interrupts: https://docs.rs/stm32f1/latest/stm32f1/stm32f103/enum.Interrupt.html
+// TIM1 pid loop timer (controlling the plant)
+// TIM2 pwm timer (motor direction and rate)
+// TIM3 monotonmic clock timer
+// TIM4 qeimanager (angle encoder)
 
+// help from  henrik_alser at https://github.com/kalkyl/f103-rtic/blob/main/src/mono.rs
 
 use defmt_rtt as _; // transport layer for defmt logs
 
@@ -46,8 +48,8 @@ mod app {
 
     const PID_freq: u32 = 800;
 
-    #[monotonic(binds = TIM2, default = true)]
-    type MyMono = MonoTimer<pac::TIM2, 1_000>;
+    #[monotonic(binds = TIM3, default = true)]
+    type MyMono = MonoTimer<pac::TIM3, 1_000>;
 
     // #[monotonic(binds = SysTick, default = true)]
     // type MonoTimer = DwtSystick<48_000_000>; // 48 MHz
@@ -70,12 +72,12 @@ mod app {
         signal_led: PA2<Output<PushPull>>,
         rate_switch: PA3<Input<PullUp>>,
 
-        tmr3: CountDownTimer<stm32::TIM3>,
+        tmr1: CountDownTimer<stm32::TIM1>, // pid loop timer
         error_prior: f64,
         integral_prior: f64,
-        epoch: i64,
+        epoch: f64,
         last_position: i64,
-        t_last_position_change: i64,
+        t_last_position_change: f64,
 
         pwm_backward: PwmChannel<stm32f1xx_hal::pac::TIM2, stm32f1xx_hal::pwm::C1>,
         pwm_forward: PwmChannel<stm32f1xx_hal::pac::TIM2, stm32f1xx_hal::pwm::C2>,
@@ -115,7 +117,7 @@ mod app {
         signal_led.set_low();
 
         // set up system timer
-        let mono = MyMono::new(cx.device.TIM2, &clocks);
+        let mono = MyMono::new(cx.device.TIM3, &clocks);
 
         //let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, clocks.hclk().0);
         //let mono = DwtSystick::new(&mut cx.core.DCB, cx.core.DWT, cx.core.SYST, 10_000u32);
@@ -168,13 +170,14 @@ mod app {
         let rate_switch = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
 
         //------------
-        // Use TIM3 for the PID controller task
-        let mut tmr3 = Timer::tim3(cx.device.TIM3, &clocks).start_count_down(PID_freq.hz());
-        tmr3.listen(Event::Update);
+        // Use TIM1 for the PID controller task
+        let mut tmr1 = Timer::tim1(cx.device.TIM1, &clocks).start_count_down(PID_freq.hz());
+        tmr1.listen(Event::Update);
 
         //------------
-        // kick off the main thread
+        // kick off the threads
         main::spawn().ok();
+        pid_update::spawn().ok();
 
         // return the resources (and the monotonic timer)
         (
@@ -188,13 +191,13 @@ mod app {
                 // Initialization of local resources go here
                 onboard_led,
                 signal_led,
-                tmr3,
+                tmr1, // PID loop
                 rate_switch,
                 integral_prior: 0.0,
                 error_prior: 0.0,
-                epoch: 0,
+                epoch: 0.0,
                 last_position: 0,
-                t_last_position_change: 0,
+                t_last_position_change: 0.0,
                 pwm_backward: pwm_backward,
                 pwm_forward: pwm_forward,
                 pwm_max_duty: max_duty,
@@ -230,11 +233,9 @@ mod app {
         let signal_led = cx.local.signal_led;
         signal_led.toggle();
 
-//        let t = as_s(monotonics::now().duration_since_epoch());
-        let t = as_s(monotonics::now());
+        let t = as_ms(monotonics::now().duration_since_epoch()) as f64 /1000.0;
 
         // 1.08 deler compenseert voor foute klok?
-
         const TRACKING_SPEED_mARCS_PER_S: [f64; 3] = [
             15000./1.08,
             14685./1.08,
@@ -242,7 +243,7 @@ mod app {
 
         // compute angle setpoint in milli arcseconds (tricky, rounding errors galore)
         let angle_setpoint: f64 =
-            TRACKING_SPEED_mARCS_PER_S[0] * (t - *epoch) as f64;
+            TRACKING_SPEED_mARCS_PER_S[0] * (t - *epoch);
 
         // mount geometry specific coeficients
 
@@ -281,7 +282,7 @@ mod app {
                 defmt::println!("dt {}", (t-*t_last_position_change));
                 defmt::println!("setpoint {}", *setpoint);
                 defmt::println!("position {}", *last_position);
-                if (t - *t_last_position_change) > 3 {
+                if (t - *t_last_position_change) > 5.0 {
                     // more than x seconds passed since last position change:
                     // stalled
                     defmt::println!("stalled");
@@ -294,25 +295,17 @@ mod app {
                         *tracking = true;
                         *epoch = t; // start time of this run
                         motor_pos.reset(); // set count to 0 at starting point
+                        *t_last_position_change = t; // ensure we don't run into this again immediately
                     }
                 }
                 if *tracking {
 
-                    *setpoint = target_count;
+                    *setpoint = target_count+3000;
                 }
             });
-        main::spawn_after(ExtU32::millis(1000u32)).ok();
+        main::spawn_after(ExtU32::millis(5u32)).ok();
     }
 
-    // Interrupt task for TIM2, the PID counter timer
-    #[task(binds = TIM3, priority = 2, local = [tmr3])]
-    fn tim3(cx: tim3::Context) {
-        // Delegate the state update to a software task
-        pid_update::spawn().unwrap();
-        // Restart the timer and clear the interrupt flag
-        cx.local.tmr3.start(PID_freq.hz());
-        cx.local.tmr3.clear_update_interrupt_flag();
-    }
 
     // update the PID loop; skeleton
     // with help from henrik_alser and adamgreig
@@ -329,6 +322,7 @@ mod app {
     fn pid_update(cx: pid_update::Context) {
 
         let onboard_led = cx.local.onboard_led;
+        // defmt::println!("pid_update");
 
         let setpoint = cx.shared.setpoint;
         let motor_pos = cx.shared.motor_pos;
@@ -340,9 +334,9 @@ mod app {
         let pwm_backward = cx.local.pwm_backward;
         let pwm_max_duty = cx.local.pwm_max_duty;
 
-        let Kp: f64 = 2.* 32.0;
-        let Ki: f64 = 0.0;
-        let Kd: f64 = 2.0;
+        let Kp: f64 = 256.0;
+        let Ki: f64 = 0.000;
+        let Kd: f64 = 128.0;
         let bias: f64 = *pwm_max_duty as f64 / 100.0;
 
         (setpoint, motor_pos).lock(|setpoint, motor_pos| {
@@ -354,15 +348,15 @@ mod app {
             let position_error: f64 = *setpoint as f64 - position as f64;
 
             // pid control
-            let integral = *integral_prior + position_error as f64 / PID_freq as f64;
-            let derivative = (position_error - *error_prior) * PID_freq as f64;
+            let integral = *integral_prior + position_error as f64 / 1000.;
+            let derivative = (position_error - *error_prior) * 1000.;
             let mut pwm_setting = Kp * position_error + Ki * integral + Kd * derivative + bias;
 
             *integral_prior = integral;
             *error_prior = position_error;
 
-            if pwm_setting > (*pwm_max_duty).into() {
-                pwm_setting = (*pwm_max_duty).into();
+            if abs(pwm_setting) > (*pwm_max_duty).into() {
+                pwm_setting = *pwm_max_duty as f64 * sign(pwm_setting);
             };
 
             // set pwm
@@ -373,18 +367,35 @@ mod app {
                 pwm_forward.set_duty(0);
                 pwm_backward.set_duty(-pwm_setting as u16);
             };
-        })
+        });
+        pid_update::spawn_after(1.millis()).ok();
     }
 
-    fn as_s (dt: dwt_systick_monotonic::fugit::Instant<u32, 1, 1_000>) -> i64 {
-        (dt.ticks()/48_000_000) as i64
+    // fn as_s (dt: dwt_systick_monotonic::fugit::Instant<u32, 1, 10_000>) -> i64 {
+    //     (dt.ticks()/48_000_000) as i64
+    // }
+
+    fn as_s<const NOM: u32, const DENOM: u32>(
+        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
+    ) -> i64
+    {
+        let secs: dwt_systick_monotonic::fugit::SecsDurationU32 = d.convert();
+        secs.ticks() as i64
+    }
+    fn as_ms<const NOM: u32, const DENOM: u32>(
+        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
+    ) -> i64
+    {
+        let millis: dwt_systick_monotonic::fugit::MillisDurationU32 = d.convert();
+        millis.ticks() as i64
     }
 
-//     fn as_s<const NOM: u32, const DENOM: u32>(
-//         d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
-//     ) -> i64
-//     {
-//         let secs: dwt_systick_monotonic::fugit::SecsDurationU32 = d.convert();
-//         secs.ticks() as i64
-//     }
+    fn sign(f: f64) -> f64 {
+        if f < 0.0 { -1.0 } else { 1.0 }
+    }
+
+    fn abs(f: f64) -> f64 {
+        f * sign(f)
+    }
+
 }
