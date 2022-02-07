@@ -46,6 +46,9 @@ mod app {
     // wrapper around quadratue encoder interface so it becomes i64 in stead of u32
     use qei::QeiManager;
 
+    // switch debouncer
+    use debouncr::{debounce_2, Repeat2, Edge, Debouncer};
+
     const PID_freq: u32 = 800;
 
     #[monotonic(binds = TIM3, default = true)]
@@ -60,6 +63,7 @@ mod app {
     struct Shared {
         // TODO: Add resources
         tracking: bool, // is system in tracking state? if not: retracting
+        rate_index: usize, // index in the rating speed table
         setpoint: i64,  // target position for digital servo
         motor_pos:
             QeiManager<Qei<stm32::TIM4, Tim4NoRemap, (PB6<Input<Floating>>, PB7<Input<Floating>>)>>,
@@ -71,6 +75,7 @@ mod app {
         onboard_led: PC13<Output<PushPull>>,
         signal_led: PA2<Output<PushPull>>,
         rate_switch: PA3<Input<PullUp>>,
+        rate_switch_state: Debouncer<u8, Repeat2>,
 
         tmr1: CountDownTimer<stm32::TIM1>, // pid loop timer
         error_prior: f64,
@@ -116,6 +121,7 @@ mod app {
         let mut signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
         signal_led.set_low();
 
+
         // set up system timer
         let mono = MyMono::new(cx.device.TIM3, &clocks);
 
@@ -136,7 +142,7 @@ mod app {
         );
 
 
-        let max_duty = pwm.get_max_duty();
+        let max_duty = pwm.get_max_duty() * 5 / 4;
 
         let mut pwm_channels = pwm.split();
 
@@ -168,6 +174,7 @@ mod app {
         //------------
         // tracking rate selection control switch input Pullup.
         let rate_switch = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
+//        let mut debouncer = debounce_stateful_16(rate_switch.is_high());
 
         //------------
         // Use TIM1 for the PID controller task
@@ -178,12 +185,14 @@ mod app {
         // kick off the threads
         main::spawn().ok();
         pid_update::spawn().ok();
+        rate_update::spawn().ok();
 
         // return the resources (and the monotonic timer)
         (
             Shared {
                 // Initialization of shared resources go here
                 tracking: false,
+                rate_index: 2, // start at siderial rate
                 setpoint: -i64::MAX, // initial setpoint minus infinite
                 motor_pos,
             },
@@ -193,6 +202,7 @@ mod app {
                 signal_led,
                 tmr1, // PID loop
                 rate_switch,
+                rate_switch_state: debounce_2(false),
                 integral_prior: 0.0,
                 error_prior: 0.0,
                 epoch: 0.0,
@@ -218,8 +228,8 @@ mod app {
     // TODO: Add tasks
     // &- means that shared resource is 'not locked'
     #[task(
-        shared=[tracking, motor_pos, setpoint],
-        local=[epoch, signal_led, last_position, t_last_position_change],
+        shared=[tracking, motor_pos, setpoint, rate_index],
+        local=[epoch, last_position, t_last_position_change],
     )]
     fn main(cx: main::Context) {
 
@@ -229,9 +239,8 @@ mod app {
         let mut last_position = cx.local.last_position;
         let mut t_last_position_change = cx.local.t_last_position_change;
         let mut setpoint = cx.shared.setpoint;
+        let mut rate_index = cx.shared.rate_index;
 
-        let signal_led = cx.local.signal_led;
-        signal_led.toggle();
 
         let t = as_ms(monotonics::now().duration_since_epoch()) as f64 /1000.0;
 
@@ -241,9 +250,12 @@ mod app {
             14685./1.08,
             15041./1.08 ];
 
+        let mut angle_setpoint: f64 = 0.0;
         // compute angle setpoint in milli arcseconds (tricky, rounding errors galore)
-        let angle_setpoint: f64 =
-            TRACKING_SPEED_mARCS_PER_S[0] * (t - *epoch);
+        rate_index.lock(|rate_index| {
+            angle_setpoint =
+                TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch);
+        });
 
         // mount geometry specific coeficients
 
@@ -260,7 +272,7 @@ mod app {
               ( 382.41e-15 + angle_setpoint *
                 ( - 20.517e-21 + angle_setpoint * 268.44e-30  )
               )
-            )) as i64;
+            )) as i64 ;
 
         (tracking, motor_pos, setpoint)
             .lock(|tracking, motor_pos, setpoint| {
@@ -277,11 +289,11 @@ mod app {
 
                 *last_position = position;
 
-                defmt::println!("*reported time since epoch {}", t);
-                defmt::println!("last t_last_position_change {}", *t_last_position_change);
-                defmt::println!("dt {}", (t-*t_last_position_change));
-                defmt::println!("setpoint {}", *setpoint);
-                defmt::println!("position {}", *last_position);
+                // defmt::println!("*reported time since epoch {}", t);
+                // defmt::println!("last t_last_position_change {}", *t_last_position_change);
+                // defmt::println!("dt {}", (t-*t_last_position_change));
+                // defmt::println!("setpoint {}", *setpoint);
+                // defmt::println!("position {}", *last_position);
                 if (t - *t_last_position_change) > 5.0 {
                     // more than x seconds passed since last position change:
                     // stalled
@@ -293,6 +305,7 @@ mod app {
                     } else {
                         // stalled and not tracking: we just retracted: start tracking
                         *tracking = true;
+                        *setpoint = 0;
                         *epoch = t; // start time of this run
                         motor_pos.reset(); // set count to 0 at starting point
                         *t_last_position_change = t; // ensure we don't run into this again immediately
@@ -300,10 +313,10 @@ mod app {
                 }
                 if *tracking {
 
-                    *setpoint = target_count+3000;
+                    *setpoint = target_count;
                 }
             });
-        main::spawn_after(ExtU32::millis(5u32)).ok();
+        main::spawn_after(ExtU32::millis(10u32)).ok();
     }
 
 
@@ -334,10 +347,10 @@ mod app {
         let pwm_backward = cx.local.pwm_backward;
         let pwm_max_duty = cx.local.pwm_max_duty;
 
-        let Kp: f64 = 256.0;
-        let Ki: f64 = 0.000;
-        let Kd: f64 = 128.0;
-        let bias: f64 = *pwm_max_duty as f64 / 100.0;
+        let Kp: f64 = 128.0;
+        let Ki: f64 = 64.0;
+        let Kd: f64 = 0.0;
+        let bias: f64 = *pwm_max_duty as f64 / 10.0;
 
         (setpoint, motor_pos).lock(|setpoint, motor_pos| {
             onboard_led.toggle();
@@ -348,10 +361,11 @@ mod app {
             let position_error: f64 = *setpoint as f64 - position as f64;
 
             // pid control
-            let integral = *integral_prior + position_error as f64 / 1000.;
+            let mut integral = *integral_prior + position_error as f64 / 1000.;
             let derivative = (position_error - *error_prior) * 1000.;
             let mut pwm_setting = Kp * position_error + Ki * integral + Kd * derivative + bias;
 
+            if abs(integral) > 10000.0 {integral = 0.0 * sign(integral)};
             *integral_prior = integral;
             *error_prior = position_error;
 
@@ -370,6 +384,63 @@ mod app {
         });
         pid_update::spawn_after(1.millis()).ok();
     }
+
+
+    // update the rate code;
+    #[task(
+        shared = [
+            rate_index,  // index in rate table
+        ],
+        local = [rate_switch, rate_switch_state, signal_led, d: u32 = 0]
+    )]
+    fn rate_update(cx: rate_update::Context) {
+
+        let signal_led = cx.local.signal_led;
+
+
+        // decimal counter for LED pattern
+        let d: &mut u32 = cx.local.d;
+        *d = (*d + 1) % 20;
+
+        // rate index in speed table
+        let mut rate_index = cx.shared.rate_index;
+
+        // Poll button
+        let pressed: bool = cx.local.rate_switch.is_low();
+
+        // Update state
+        let edge = cx.local.rate_switch_state.update(pressed);
+
+
+        rate_index.lock(|rate_index| {
+
+            // Dispatch event
+            if edge == Some(Edge::Rising) {
+
+            } else if edge == Some(Edge::Falling) {
+                *rate_index = (*rate_index +1) % 3; // cycle through rates
+                defmt::println!("rate_index {}", *rate_index);
+            }
+
+            // signals in tenths of seconds, start times
+            const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
+
+            // signal led
+            // every two seconds
+            // determine time in tenths of seconds
+            // check if that bit is on in the pattern of the rate_index
+            if (TRACK_PATTERN[*rate_index] & (0b1 << *d) > 0) {
+                signal_led.set_high();
+            } else {
+                signal_led.set_low();
+            };
+        }
+        );
+
+        // Re-schedule the timer interrupt
+        rate_update::spawn_after(100.millis()).ok();
+    }
+
 
     // fn as_s (dt: dwt_systick_monotonic::fugit::Instant<u32, 1, 10_000>) -> i64 {
     //     (dt.ticks()/48_000_000) as i64
