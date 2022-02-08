@@ -17,7 +17,8 @@ Main functions:
 - allow user to select drive speed using on-off switch
 - feedback selected drive speed index on indicator LED
 
-Great help for putting this together was given by the folks at ## Dependencies
+Great help for putting this together was given by the great folks at
+#rtic:matrix.org .
 
 
 ### How to set up
