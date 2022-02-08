@@ -457,8 +457,12 @@ mod app {
         if f < 0.0 { -1.0 } else { 1.0 }
     }
 
-    fn abs(f: f64) -> f64 {
-        f * sign(f)
+    fn abs(x: f64) -> f64 {
+        f64::from_bits(x.to_bits() & 0x7FFF_FFFF_FFFF_FFFF)
     }
+
+    // fn abs(f: f64) -> f64 {
+    //     f * sign(f)
+    // }
 
 }
