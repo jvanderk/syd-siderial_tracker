@@ -1,4 +1,5 @@
-//! RTIC Monotonic implementation
+//! RTIC Monotonic implementation using TIM3
+// given by henrik_alser
 
 use core::convert::TryInto;
 
