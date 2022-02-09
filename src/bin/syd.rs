@@ -2,7 +2,6 @@
 #![no_main]
 #![no_std]
 
-
 // Mapping
 // list of interrupts: https://docs.rs/stm32f1/latest/stm32f1/stm32f103/enum.Interrupt.html
 // TIM2 pwm timer (motor direction and rate)
@@ -24,37 +23,41 @@ mod app {
     use syd::mono::{ExtU32, MonoTimer};
 
     use stm32f1xx_hal::{
-        gpio::{gpioa::{PA2, PA3}, Output, PushPull, Floating, Input, PullUp},
         gpio::gpiob::{PB6, PB7},
         gpio::gpioc::PC13,
+        gpio::{
+            gpioa::{PA2, PA3},
+            Floating, Input, Output, PullUp, PushPull,
+        },
+        pac,
         prelude::*,
         qei::{Qei, QeiOptions},
         stm32,
-        pac,
         timer::{Tim2NoRemap, Tim4NoRemap, Timer},
     };
 
     // wrapper around quadratue encoder interface so it becomes i64 in stead of u32
+    // how does this mesh with qei from the HAL?
     use qei::QeiManager;
 
     // switch debouncer; used fro rate selection
-    use debouncr::{debounce_2, Repeat2, Edge, Debouncer};
+    use debouncr::{debounce_2, Debouncer, Edge, Repeat2};
 
     #[monotonic(binds = TIM3, default = true)]
-    type MyMono = MonoTimer<pac::TIM3, 1_000>;
-
+    type MyMono = MonoTimer<pac::TIM3, 10_000>;
 
     // Shared resources definition
+    type SomePin = PB6<Input<Floating>>;
+    type OtherPin = PB7<Input<Floating>>;
+    type Qei4 = Qei<stm32::TIM4, Tim4NoRemap, (SomePin, OtherPin)>;
+    type QeiManager4 = QeiManager<Qei4>;
+
     #[shared]
     struct Shared {
-        tracking: bool,                   // system in tracking state?
-        rate_index: usize,                // index in the rating speed table
-        setpoint: i64,                    // target position for digital servo
-        motor_pos:QeiManager<Qei          // quadrature encoder counter
-                             <stm32::TIM4,
-                              Tim4NoRemap,
-                              (PB6<Input<Floating>>, PB7<Input<Floating>>)>
-                             >,
+        tracking: bool,     // system in tracking state?
+        rate_index: usize, // index in the rating speed table
+        setpoint: i64,     // target position for digital servo
+        motor_pos: QeiManager4, //
     }
 
     // Local resources
@@ -102,7 +105,6 @@ mod app {
         // set up signal LED on PA2
         let mut signal_led = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
         signal_led.set_low();
-
 
         // set up system timer
         let mono = MyMono::new(cx.device.TIM3, &clocks);
@@ -162,7 +164,7 @@ mod app {
             Shared {
                 // Initialization of shared resources go here
                 tracking: false,
-                rate_index: 2, // start at siderial rate
+                rate_index: 2,       // start at siderial rate
                 setpoint: -i64::MAX, // initial setpoint minus infinite
                 motor_pos,
             },
@@ -172,14 +174,13 @@ mod app {
                 signal_led,
                 rate_switch,
                 rate_switch_state: debounce_2(false),
-                pwm_backward: pwm_backward,
-                pwm_forward: pwm_forward,
+                pwm_backward,
+                pwm_forward,
                 pwm_max_duty: max_duty,
             },
             init::Monotonics(mono), // give the monotonic to RTIC
         )
     }
-
 
     //------------
     // main loop, maintaining count setpoint
@@ -190,8 +191,7 @@ mod app {
                t_last_position_change:f64 = 0.0],
     )]
     fn main(cx: main::Context) {
-
-        let tracking = cx.shared.tracking;   // bool: are we tracking?
+        let tracking = cx.shared.tracking; // bool: are we tracking?
         let motor_pos = cx.shared.motor_pos;
 
         let epoch = cx.local.epoch;
@@ -201,92 +201,82 @@ mod app {
         let setpoint = cx.shared.setpoint;
         let mut rate_index = cx.shared.rate_index;
 
-
         //------------
         // find time since start of timer
-        let t = as_ms(monotonics::now().duration_since_epoch()) as f64 /1000.0;
+        let t = as_ms(monotonics::now().duration_since_epoch()) as f64 / 1000.0;
 
         //------------
         // set speed table
         // 1.08 deler compenseert voor foute klok?
-        const TRACKING_SPEED_mARCS_PER_S: [f64; 3] = [
-            15000./1.08,
-            14685./1.08,
-            15041./1.08 ];
+        const TRACKING_SPEED_mARCS_PER_S: [f64; 3] = [15000. / 1.08, 14685. / 1.08, 15041. / 1.08];
 
         //------------
         // compute setpoint angle (time * tracking speed)
         let mut angle_setpoint: f64 = 0.0;
         // compute angle setpoint in milli arcseconds (tricky, rounding errors galore)
         rate_index.lock(|rate_index| {
-            angle_setpoint =
-                TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch);
+            angle_setpoint = TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch);
         });
-
 
         //------------
         // mount geometry specific coeficients
         // convert angle in  milli-arcseconds to encoder setpoint
-        let target_count = (6.4 +
-            angle_setpoint  *
-            ( 2.8938e-3 + angle_setpoint *
-              ( 382.41e-15 + angle_setpoint *
-                ( - 20.517e-21 + angle_setpoint * 268.44e-30  )
-              )
-            )) as i64 ;
+        let target_count = (6.4
+            + angle_setpoint
+                * (2.8938e-3
+                    + angle_setpoint
+                        * (382.41e-15
+                            + angle_setpoint * (-20.517e-21 + angle_setpoint * 268.44e-30))))
+            as i64;
 
-        (tracking, motor_pos, setpoint)
-            .lock(|tracking, motor_pos, setpoint| {
-                // get position of motor
-                motor_pos.sample().unwrap();
-                let position = motor_pos.count();
+        (tracking, motor_pos, setpoint).lock(|tracking, motor_pos, setpoint| {
+            // get position of motor
+            motor_pos.sample().unwrap();
+            let position = motor_pos.count();
 
+            // defmt::println!("*reported time since epoch {}", t);
+            // defmt::println!("last t_last_position_change {}", *t_last_position_change);
+            // defmt::println!("dt {}", (t-*t_last_position_change));
+            // defmt::println!("setpoint {}", *setpoint);
+            // defmt::println!("position {}", *last_position);
 
-                // defmt::println!("*reported time since epoch {}", t);
-                // defmt::println!("last t_last_position_change {}", *t_last_position_change);
-                // defmt::println!("dt {}", (t-*t_last_position_change));
-                // defmt::println!("setpoint {}", *setpoint);
-                // defmt::println!("position {}", *last_position);
+            //------------
+            // check if motor is stalled; assume we are always moving at second scale
+            // if stalled, decide what to do next
 
-                //------------
-                // check if motor is stalled; assume we are always moving at second scale
-                // if stalled, decide what to do next
+            if position != *last_position {
+                *t_last_position_change = t;
+            }
 
-                if position != *last_position {
-                    *t_last_position_change = t;
-                }
+            *last_position = position;
 
-                *last_position = position;
-
-                if (t - *t_last_position_change) > 3.0 {
-                    // more than x seconds passed since last position change:
-                    // stalled
-                    defmt::println!("stalled");
-                    if *tracking {
-                        // stalled and tracking: have to retract
-                        *setpoint = -i64::MAX;
-                        *tracking = false;
-                    } else {
-                        // stalled and not tracking: we just retracted: start tracking
-                        *tracking = true;
-                        *setpoint = 0;
-                        *epoch = t; // start time of this run
-                        motor_pos.reset(); // set count to 0 at starting point
-                        *t_last_position_change = t; // ensure we don't run into this again immediately
-                    }
-                }
-
-                //------------
-                // set target count if we're tracking
+            if (t - *t_last_position_change) > 3.0 {
+                // more than x seconds passed since last position change:
+                // stalled
+                defmt::println!("stalled");
                 if *tracking {
-                    *setpoint = target_count;
+                    // stalled and tracking: have to retract
+                    *setpoint = -i64::MAX;
+                    *tracking = false;
+                } else {
+                    // stalled and not tracking: we just retracted: start tracking
+                    *tracking = true;
+                    *setpoint = 0;
+                    *epoch = t; // start time of this run
+                    motor_pos.reset(); // set count to 0 at starting point
+                    *t_last_position_change = t; // ensure we don't run into this again immediately
                 }
+            }
 
-            }); // lock
+            //------------
+            // set target count if we're tracking
+            if *tracking {
+                *setpoint = target_count;
+            }
+        }); // lock
 
-        main::spawn_after(ExtU32::millis(10u32)).ok();
+        main::spawn_after(ExtU32::millis(5u32)).ok();
     }
-
 
     // update the PID loop; skeleton
     // with help from henrik_alser and adamgreig
@@ -302,7 +292,6 @@ mod app {
         ]
     )]
     fn pid_update(cx: pid_update::Context) {
-
         //------------
         // flip the onboard led
         let onboard_led = cx.local.onboard_led;
@@ -333,7 +322,6 @@ mod app {
         let error_prior = cx.local.error_prior;
 
         (setpoint, motor_pos).lock(|setpoint, motor_pos| {
-
             // get position of motor
             motor_pos.sample().unwrap();
             let position = motor_pos.count();
@@ -346,7 +334,9 @@ mod app {
 
             //------------
             // this is to limit transition effect after retraction
-            if abs(integral) > 10000.0 {integral = 0.0 * sign(integral)};
+            if abs(integral) > 10000.0 {
+                integral = 0.0 * sign(integral)
+            };
 
             //------------
             // save the values for next iteration
@@ -377,9 +367,7 @@ mod app {
         //------------
         // respawn
         pid_update::spawn_after(1.millis()).ok();
-
     } // PID update loop
-
 
     //------------
     // update the angular rotation rate and actuate signal led
@@ -394,7 +382,6 @@ mod app {
         ]
     )]
     fn rate_update(cx: rate_update::Context) {
-
         // hw bit handle
         let signal_led = cx.local.signal_led;
 
@@ -414,10 +401,9 @@ mod app {
 
         //
         rate_index.lock(|rate_index| {
-
             //  process event
             if edge == Some(Edge::Falling) {
-                *rate_index = (*rate_index +1) % 3; // cycle through rates
+                *rate_index = (*rate_index + 1) % 3; // cycle through rates
                 defmt::println!("rate_index {}", *rate_index);
             }
 
@@ -432,21 +418,17 @@ mod app {
             } else {
                 signal_led.set_low();
             };
-        }
-        );
+        });
 
         // respawn
         rate_update::spawn_after(100.millis()).ok();
     }
 
-
-
     //------------
     // get the length of a Duration in ms
     fn as_ms<const NOM: u32, const DENOM: u32>(
-        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>
-    ) -> i64
-    {
+        d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>,
+    ) -> i64 {
         let millis: dwt_systick_monotonic::fugit::MillisDurationU32 = d.convert();
         millis.ticks() as i64
     }
@@ -454,7 +436,11 @@ mod app {
     //------------
     // utility functions not present in f64 implementation in no_std
     fn sign(f: f64) -> f64 {
-        if f < 0.0 { -1.0 } else { 1.0 }
+        if f < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }
     }
 
     fn abs(x: f64) -> f64 {
@@ -464,5 +450,4 @@ mod app {
     // fn abs(f: f64) -> f64 {
     //     f * sign(f)
     // }
-
 }
