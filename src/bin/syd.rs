@@ -17,27 +17,32 @@ use syd as _; // ?
 #[rtic::app(device =  stm32f1xx_hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
 
-    use stm32f1xx_hal::pwm::PwmChannel;
-
     // code given by henrik_alser for TIM3 based MonoTimer
     use syd::mono::{ExtU32, MonoTimer};
 
     use stm32f1xx_hal::{
-        gpio::gpiob::{PB6, PB7},
-        gpio::gpioc::PC13,
+        gpio::gpiob::{PB6, PB7}, // qei pins
+        gpio::gpioc::PC13,       // onboard led
         gpio::{
-            gpioa::{PA2, PA3},
-            Floating, Input, Output, PullUp, PushPull,
+            gpioa::{PA2, PA3}, // pwm control
+            Floating,
+            Input,
+            Output,
+            PullUp,
+            PushPull,
         },
         pac,
         prelude::*,
+        pwm::PwmChannel,
         qei::{Qei, QeiOptions},
         stm32,
         timer::{Tim2NoRemap, Tim4NoRemap, Timer},
     };
 
-    // wrapper around quadratue encoder interface so it becomes i64 in stead of u32
-    // how does this mesh with qei from the HAL?
+    //------------
+    // Wrapper around quadrature encoder interface so it becomes i64 in
+    // stead of u32; The qei from the HAL is overloaded by this name
+    // and the QeiManager is added to the arsenal...
     use qei::QeiManager;
 
     // switch debouncer; used fro rate selection
@@ -54,9 +59,9 @@ mod app {
 
     #[shared]
     struct Shared {
-        tracking: bool,     // system in tracking state?
-        rate_index: usize, // index in the rating speed table
-        setpoint: i64,     // target position for digital servo
+        tracking: bool,         // system in tracking state?
+        rate_index: usize,      // index in the rating speed table
+        setpoint: i64,          // target position for digital servo
         motor_pos: QeiManager4, //
     }
 
@@ -185,7 +190,12 @@ mod app {
     //------------
     // main loop, maintaining count setpoint
     #[task(
-        shared=[tracking, motor_pos, setpoint, rate_index],
+        shared=[
+	    tracking,
+	    motor_pos,
+	    setpoint,
+	    rate_index
+	],
         local=[epoch:f64 = 0.0,
                last_position:i64 = 0,
                t_last_position_change:f64 = 0.0],
@@ -382,24 +392,29 @@ mod app {
         ]
     )]
     fn rate_update(cx: rate_update::Context) {
-        // hw bit handle
-        let signal_led = cx.local.signal_led;
-
-        // decimal counter for LED pattern
-        // assuming 100ms between calls cycle takes 20 * 0.1 = 2.0 s
-        let d: &mut u32 = cx.local.d;
-        *d = (*d + 1) % 20;
-
         // rate index in speed table
         let mut rate_index = cx.shared.rate_index;
 
-        // oll button
-        let pressed: bool = cx.local.rate_switch.is_low();
+        let rate_update::LocalResources {
+            rate_switch,
+            rate_switch_state,
+            signal_led,
+            d,
+        } = cx.local;
 
-        // update state of button
-        let edge = cx.local.rate_switch_state.update(pressed);
+        // decimal counter for LED pattern
+        // assuming 100ms between calls cycle takes 20 * 0.1 = 2.0 s
+        *d = (*d + 1) % 20;
 
-        //
+        // poll button and update state
+        let pressed: bool = rate_switch.is_low();
+        let edge = rate_switch_state.update(pressed);
+
+        // signals in tenths of seconds, start times
+        const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
+
+        let mut rate_unlock_dummy: usize = 0;
+
         rate_index.lock(|rate_index| {
             //  process event
             if edge == Some(Edge::Falling) {
@@ -407,18 +422,17 @@ mod app {
                 defmt::println!("rate_index {}", *rate_index);
             }
 
-            // signals in tenths of seconds, start times
-            const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
-
-            // signal led:
-            // check if bit# d is on in the pattern of the rate_index
-            // if so, switch on signal LED
-            if TRACK_PATTERN[*rate_index] & (0b1 << *d) > 0 {
-                signal_led.set_high();
-            } else {
-                signal_led.set_low();
-            };
+            rate_unlock_dummy = *rate_index;
         });
+
+        // signal led: (this polls rate_index so is in the lock, but it never changes the value
+        // check if bit# d is on in the pattern of the rate_index
+        // if so, switch on signal LED
+        if TRACK_PATTERN[rate_unlock_dummy] & (0b1 << *d) > 0 {
+            signal_led.set_high();
+        } else {
+            signal_led.set_low();
+        };
 
         // respawn
         rate_update::spawn_after(100.millis()).ok();
