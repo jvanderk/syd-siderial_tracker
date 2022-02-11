@@ -196,9 +196,9 @@ mod app {
 	    setpoint,
 	    rate_index
 	],
-        local=[epoch:f64 = 0.0,
+        local=[epoch:f32 = 0.0,
                last_position:i64 = 0,
-               t_last_position_change:f64 = 0.0],
+               t_last_position_change:f32 = 0.0],
     )]
     fn main(cx: main::Context) {
         let tracking = cx.shared.tracking; // bool: are we tracking?
@@ -213,20 +213,18 @@ mod app {
 
         //------------
         // find time since start of timer
-        let t = as_ms(monotonics::now().duration_since_epoch()) as f64 / 1000.0;
+        let t = as_ms(monotonics::now().duration_since_epoch()) as f32 / 1000.0;
 
         //------------
         // set speed table
         // 1.08 deler compenseert voor foute klok?
-        const TRACKING_SPEED_mARCS_PER_S: [f64; 3] = [15000. / 1.08, 14685. / 1.08, 15041. / 1.08];
+        const TRACKING_SPEED_mARCS_PER_S: [f32; 3] = [15000. / 1.08, 14685. / 1.08, 15041. / 1.08];
 
         //------------
         // compute setpoint angle (time * tracking speed)
-        let mut angle_setpoint: f64 = 0.0;
         // compute angle setpoint in milli arcseconds (tricky, rounding errors galore)
-        rate_index.lock(|rate_index| {
-            angle_setpoint = TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch);
-        });
+        let angle_setpoint: f32 =
+            rate_index.lock(|rate_index| TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch));
 
         //------------
         // mount geometry specific coeficients
@@ -295,8 +293,8 @@ mod app {
                   motor_pos, // qei encoder
         ],
         local = [onboard_led,
-                 integral_prior:f64 = 0.0,
-                 error_prior:f64    = 0.0, // PID parameters
+                 integral_prior:f32 = 0.0,
+                 error_prior:f32    = 0.0, // PID parameters
                  pwm_backward, pwm_forward, // pwm channels
                  pwm_max_duty, // constant
         ]
@@ -321,10 +319,10 @@ mod app {
 
         //------------
         // PID parameters; experimentally determined, probably highly suboptimal
-        let Kp: f64 = 320.0;
-        let Ki: f64 = 32.0;
-        let Kd: f64 = 0.01;
-        let bias: f64 = *pwm_max_duty as f64 / 10.0;
+        let Kp: f32 = 320.0;
+        let Ki: f32 = 32.0;
+        let Kd: f32 = 0.01;
+        let bias: f32 = *pwm_max_duty as f32 / 10.0;
 
         //------------
         // remember from previous iteration
@@ -335,10 +333,10 @@ mod app {
             // get position of motor
             motor_pos.sample().unwrap();
             let position = motor_pos.count();
-            let position_error: f64 = *setpoint as f64 - position as f64;
+            let position_error: f32 = *setpoint as f32 - position as f32;
 
             // pid control; assuming 1000 Hz update rate
-            let mut integral = *integral_prior + position_error as f64 / 1000.;
+            let mut integral = *integral_prior + position_error as f32 / 1000.;
             let derivative = (position_error - *error_prior) * 1000.;
             let mut pwm_setting = Kp * position_error + Ki * integral + Kd * derivative + bias;
 
@@ -356,7 +354,7 @@ mod app {
             //------------
             // limit the pwm setting to max duty cycle
             if abs(pwm_setting) > (*pwm_max_duty).into() {
-                pwm_setting = *pwm_max_duty as f64 * sign(pwm_setting);
+                pwm_setting = *pwm_max_duty as f32 * sign(pwm_setting);
             };
 
             //------------
@@ -380,7 +378,8 @@ mod app {
     } // PID update loop
 
     //------------
-    // update the angular rotation rate and actuate signal led
+    // update the angular rotation rate and actuate signal
+    // LED; run 10 times/s, fast enough for human switch control
     #[task(
         shared = [
             rate_index,  // index in rate table
@@ -406,13 +405,12 @@ mod app {
         // assuming 100ms between calls cycle takes 20 * 0.1 = 2.0 s
         *d = (*d + 1) % 20;
 
-        // poll button and update state
-        let pressed: bool = rate_switch.is_low();
-        let edge = rate_switch_state.update(pressed);
-
         // signals in tenths of seconds, start times
         const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
 
+        // poll button and update state; *rate_index is shared so we need to lock.
+        let pressed: bool = rate_switch.is_low();
+        let edge = rate_switch_state.update(pressed);
         let r = rate_index.lock(|rate_index| {
             //  process event
             if edge == Some(Edge::Falling) {
@@ -441,14 +439,14 @@ mod app {
     // get the length of a Duration in ms
     fn as_ms<const NOM: u32, const DENOM: u32>(
         d: dwt_systick_monotonic::fugit::Duration<u32, NOM, DENOM>,
-    ) -> i64 {
+    ) -> u32 {
         let millis: dwt_systick_monotonic::fugit::MillisDurationU32 = d.convert();
-        millis.ticks() as i64
+        millis.ticks()
     }
 
     //------------
-    // utility functions not present in f64 implementation in no_std
-    fn sign(f: f64) -> f64 {
+    // utility functions not present in f32 implementation in no_std
+    fn sign(f: f32) -> f32 {
         if f < 0.0 {
             -1.0
         } else {
@@ -456,11 +454,7 @@ mod app {
         }
     }
 
-    fn abs(x: f64) -> f64 {
-        f64::from_bits(x.to_bits() & 0x7FFF_FFFF_FFFF_FFFF)
+    fn abs(x: f32) -> f32 {
+        f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
     }
-
-    // fn abs(f: f64) -> f64 {
-    //     f * sign(f)
-    // }
 }
