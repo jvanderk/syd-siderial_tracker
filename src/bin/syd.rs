@@ -413,22 +413,21 @@ mod app {
         // signals in tenths of seconds, start times
         const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
 
-        let mut rate_unlock_dummy: usize = 0;
-
-        rate_index.lock(|rate_index| {
+        let r = rate_index.lock(|rate_index| {
             //  process event
             if edge == Some(Edge::Falling) {
-                *rate_index = (*rate_index + 1) % 3; // cycle through rates
-                defmt::println!("rate_index {}", *rate_index);
+                *rate_index = (*rate_index + 1) % 3 // cycle through rates
             }
-
-            rate_unlock_dummy = *rate_index;
+            *rate_index // return value
         });
 
-        // signal led: (this polls rate_index so is in the lock, but it never changes the value
-        // check if bit# d is on in the pattern of the rate_index
-        // if so, switch on signal LED
-        if TRACK_PATTERN[rate_unlock_dummy] & (0b1 << *d) > 0 {
+        if edge == Some(Edge::Falling) {
+            defmt::println!("rate_index {}", r)
+        }
+
+        // signal led:
+        // switch on if bit# d is on in the pattern of the rate_index
+        if TRACK_PATTERN[r] & (0b1 << *d) > 0 {
             signal_led.set_high();
         } else {
             signal_led.set_low();
