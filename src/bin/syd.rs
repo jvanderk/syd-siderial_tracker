@@ -122,7 +122,7 @@ mod app {
             20.khz(),
         );
 
-        let max_duty = pwm.get_max_duty();
+        let max_duty = pwm.get_max_duty() * 4 / 5;
 
         let mut pwm_channels = pwm.split();
         pwm_channels.0.enable();
@@ -158,8 +158,8 @@ mod app {
         (
             Shared {
                 // Initialization of shared resources go here
-                tracking: false,
-                rate_index: 2,       // start at siderial rate
+                tracking: true,      //false,
+                rate_index: 0,       // start at siderial rate
                 setpoint: -i64::MAX, // initial setpoint minus infinite
                 motor_pos,
             },
@@ -179,38 +179,43 @@ mod app {
 
     // main loop, maintaining count setpoint and dealing with retraction
     #[task(
-        shared=[tracking,
+        shared=[
+	    tracking,
 	    motor_pos,
 	    setpoint,
 	    rate_index
 	],
-        local=[epoch:f32 = 0.0,
-               last_position:i64 = 0,
-               t_last_position_change:f32 = 0.0],
+        local=[
+	    onboard_led,
+	    epoch:f32 = 0.0,
+            last_position:i64 = 0,
+            t_last_position_change:f32 = 0.0],
     )]
     fn main(cx: main::Context) {
-        let tracking = cx.shared.tracking; // bool: are we tracking?
-        let motor_pos = cx.shared.motor_pos;
+        let main::SharedResources {
+            tracking,
+            motor_pos,
+            setpoint,
+            mut rate_index,
+        } = cx.shared;
 
-        let epoch = cx.local.epoch;
-        let last_position = cx.local.last_position;
-        let t_last_position_change = cx.local.t_last_position_change;
+        let main::LocalResources {
+            onboard_led,
+            epoch,
+            last_position,
+            t_last_position_change,
+        } = cx.local;
 
-        let setpoint = cx.shared.setpoint;
-        let mut rate_index = cx.shared.rate_index;
-
-        //------------
-        // find time since start of timer
+        // time since start of timer in s
         let t = as_ms(monotonics::now().duration_since_epoch()) as f32 / 1000.0;
 
-        //------------
-        // set speed table
-        // 1.08 deler compenseert voor foute klok?
+        // speed table
+        // 1.08 divider compensates for measured clock speed bias
         const correction: f32 = 1.08;
         const TRACKING_SPEED_mARCS_PER_S: [f32; 3] = [
-            15000. / correction, // Solar
-            14685. / correction, // Lunar
             15041. / correction, // Siderial
+            14685. / correction, // Lunar
+            15000. / correction, // Solar
         ];
 
         // compute setpoint angle (tracking speed * time since start run)
@@ -237,23 +242,30 @@ mod app {
             let position = motor_pos.count();
 
             // record last time that position count changed
+            // switch on LED if postion changed, off otherwise
             if position != *last_position {
                 *t_last_position_change = t;
-            }
+                onboard_led.set_low()
+            } else {
+                onboard_led.set_high()
+            };
             *last_position = position;
 
             // if motor is stalled flip tracking state
             if (t - *t_last_position_change) > 3.0 {
                 defmt::println!("stalled");
+                defmt::println!("tracking: {}", *tracking);
 
                 if *tracking {
+                    defmt::println!("start retracting");
                     // stalled and tracking
                     *tracking = false;
                 } else {
+                    defmt::println!("start tracking");
                     // stalled and not tracking
                     *tracking = true;
 
-                    // record start time of this run and disarm stalled detection
+                    // record start time of this run and disarm stall detection
                     *epoch = t;
                     *t_last_position_change = t;
 
@@ -268,7 +280,7 @@ mod app {
                 *setpoint = target_count;
             } else {
                 // retract
-                *setpoint = -i64::MAX;
+                *setpoint = -i64::MAX / 2;
             }
         }); // lock
 
@@ -279,19 +291,19 @@ mod app {
     // update the PID loop
     // with help from henrik_alser and adamgreig
     #[task(
-        shared = [setpoint,  // setpoint position
-                  motor_pos, // qei encoder
+        shared = [
+	    setpoint,  // setpoint position
+            motor_pos, // qei encoder
         ],
-        local = [onboard_led,
-                 integral_prior:f32 = 0.0,
-                 error_prior:f32    = 0.0, // PID parameters
-                 pwm_backward, pwm_forward, // pwm channels
-                 pwm_max_duty, // constant
+        local = [
+            integral_prior:f32 = 0.0,
+            error_prior:f32    = 0.0, // PID parameters
+            pwm_backward, pwm_forward, // pwm channels
+            pwm_max_duty, // constant
         ]
     )]
     fn pid_update(cx: pid_update::Context) {
         let pid_update::LocalResources {
-            onboard_led,
             integral_prior, // PID parameters
             error_prior,
             pwm_backward, // pwm API
@@ -299,20 +311,17 @@ mod app {
             pwm_max_duty,
         } = cx.local;
 
-        // switch on the onboard led (inverted logic)
-        onboard_led.set_low();
-
         // this is the setpoint maintained by the main() function
         let setpoint = cx.shared.setpoint;
 
-        // qei and motor control
+        // qeimanager4
         let motor_pos = cx.shared.motor_pos;
 
         // PID parameters; experimentally determined, probably suboptimal
-        let Kp: f32 = 320.0;
-        let Ki: f32 = 32.0;
-        let Kd: f32 = 0.01;
-        let bias: f32 = *pwm_max_duty as f32 / 10.0;
+        let Kp: f32 = 550.0;
+        let Ki: f32 = 0.1;
+        let Kd: f32 = 0.1;
+        let bias: f32 = (*pwm_max_duty / 3) as f32;
 
         // compute position error
         // lock returns the error
@@ -351,9 +360,6 @@ mod app {
             pwm_forward.set_duty(0);
             pwm_backward.set_duty(-pwm_setting as u16);
         };
-
-        // switch of on board LED
-        onboard_led.set_high();
 
         // respawn 1 kHz
         pid_update::spawn_after(1.millis()).ok();
