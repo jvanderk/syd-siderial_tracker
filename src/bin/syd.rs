@@ -158,7 +158,7 @@ mod app {
         (
             Shared {
                 // Initialization of shared resources go here
-                tracking: true,      //false,
+                tracking: false,
                 rate_index: 0,       // start at siderial rate
                 setpoint: -i64::MAX, // initial setpoint minus infinite
                 motor_pos,
