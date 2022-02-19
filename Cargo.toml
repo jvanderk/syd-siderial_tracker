@@ -18,7 +18,7 @@ qei = "1.0.2"
 debouncr = "0.2.2"
 
 rtic-monotonic = "1.0.0"
-fugit = "0.3.3"
+fugit = "0.3.3"  # used in mono.rs
 
 [dependencies.stm32f1xx-hal]
 version = "0.8.0"

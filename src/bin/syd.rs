@@ -154,17 +154,17 @@ mod app {
         pid_update::spawn().ok();
         rate_update::spawn().ok();
 
-        // return the resources (and the monotonic timer)
+        // return the resources and the monotonic timer
         (
             Shared {
-                // Initialization of shared resources go here
+                // Initialization of shared resources
                 tracking: false,
-                rate_index: 0,       // start at siderial rate
-                setpoint: -i64::MAX, // initial setpoint minus infinite
+                rate_index: 0,           // start at siderial rate
+                setpoint: -i64::MAX / 2, // initial setpoint (retract)
                 motor_pos,
             },
             Local {
-                // Initialization of local resources go here
+                // Initialization of local resources
                 onboard_led,
                 signal_led,
                 rate_switch,
@@ -173,8 +173,18 @@ mod app {
                 pwm_forward,
                 pwm_max_duty: max_duty,
             },
-            init::Monotonics(mono), // give the monotonic to RTIC
+            // Move the monotonic timer to the RTIC run-time, this enables
+            // scheduling
+            init::Monotonics(mono),
         )
+    }
+
+    // Background task, runs whenever no other tasks are running
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        loop {
+            continue;
+        }
     }
 
     // main loop, maintaining count setpoint and dealing with retraction
@@ -183,13 +193,18 @@ mod app {
 	    tracking,
 	    motor_pos,
 	    setpoint,
-	    rate_index
+	    rate_index,
 	],
         local=[
 	    onboard_led,
 	    epoch:f32 = 0.0,
             last_position:i64 = 0,
-            t_last_position_change:f32 = 0.0],
+            t_last_position_change:f32 = 0.0,
+	    rate_base_angle: f32 = 0.0,
+	    rate_change_time: f32 = -1.0,
+	    last_rate: usize = 100,
+	    angle_setpoint: f32 = 0.0,
+	],
     )]
     fn main(cx: main::Context) {
         let main::SharedResources {
@@ -204,34 +219,47 @@ mod app {
             epoch,
             last_position,
             t_last_position_change,
+            rate_base_angle,
+            rate_change_time,
+            last_rate,
+            angle_setpoint,
         } = cx.local;
 
         // time since start of timer in s
         let t = as_ms(monotonics::now().duration_since_epoch()) as f32 / 1000.0;
 
+        rate_index.lock(|rate_index| {
+            if *rate_index != *last_rate {
+                *rate_base_angle = *angle_setpoint;
+                *rate_change_time = t;
+                *last_rate = *rate_index;
+            }
+        });
+
         // speed table
         // 1.08 divider compensates for measured clock speed bias
         const correction: f32 = 1.08;
         const TRACKING_SPEED_mARCS_PER_S: [f32; 3] = [
-            15041. / correction, // Siderial
-            14685. / correction, // Lunar
-            15000. / correction, // Solar
+            15041. / correction,      // Siderial
+            14685. / correction,      // Lunar
+            15000. * 6. / correction, // Solar
         ];
 
         // compute setpoint angle (tracking speed * time since start run)
         // compute angle setpoint in milli arcseconds (approach inherited from integer arithmetic)
-        let angle_setpoint: f32 =
-            rate_index.lock(|rate_index| TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *epoch));
+        *angle_setpoint = rate_index.lock(|rate_index| {
+            *rate_base_angle + TRACKING_SPEED_mARCS_PER_S[*rate_index] * (t - *rate_change_time)
+        });
 
         // mount geometry specific coeficients
         // convert angle in  milli-arcseconds to encoder setpoint
         // compute setpoint indepent of whether or not we are tracking.
         let mut target_count: i64 = (6.4
-            + angle_setpoint
+            + *angle_setpoint
                 * (2.8938e-3
-                    + angle_setpoint
+                    + *angle_setpoint
                         * (382.41e-15
-                            + angle_setpoint * (-20.517e-21 + angle_setpoint * 268.44e-30))))
+                            + *angle_setpoint * (-20.517e-21 + *angle_setpoint * 268.44e-30))))
             as i64;
 
         // this lock checks the position and sets the setpoint
@@ -268,6 +296,8 @@ mod app {
                     // record start time of this run and disarm stall detection
                     *epoch = t;
                     *t_last_position_change = t;
+                    *rate_base_angle = 0.0;
+                    *rate_change_time = t;
 
                     // set qei wrapper count and target count to 0
                     motor_pos.reset();
@@ -296,6 +326,7 @@ mod app {
             motor_pos, // qei encoder
         ],
         local = [
+	    respawn_delay_ms: u32  = 10,
             integral_prior:f32 = 0.0,
             error_prior:f32    = 0.0, // PID parameters
             pwm_backward, pwm_forward, // pwm channels
@@ -304,6 +335,7 @@ mod app {
     )]
     fn pid_update(cx: pid_update::Context) {
         let pid_update::LocalResources {
+            respawn_delay_ms,
             integral_prior, // PID parameters
             error_prior,
             pwm_backward, // pwm API
@@ -318,10 +350,11 @@ mod app {
         let motor_pos = cx.shared.motor_pos;
 
         // PID parameters; experimentally determined, probably suboptimal
-        let Kp: f32 = 550.0;
-        let Ki: f32 = 0.1;
-        let Kd: f32 = 0.1;
-        let bias: f32 = (*pwm_max_duty / 3) as f32;
+        let Kp: f32 = 150.0;
+        let Ki: f32 = 0.01;
+        let Kd: f32 = 16.;
+        let bias: f32 = (*pwm_max_duty * 0) as f32;
+        let dt: f32 = 1000. / *respawn_delay_ms as f32;
 
         // compute position error
         // lock returns the error
@@ -330,15 +363,15 @@ mod app {
             (*setpoint - motor_pos.count()) as f32
         });
 
-        // pid control; assuming 1000 Hz update rate
-        let mut integral = *integral_prior + position_error / 1000.;
+        // pid control
+        let mut integral = *integral_prior + position_error * dt;
 
         // this is to limit transition effect after retraction
         if abs(integral) > 100_000.0 {
             integral = 0.0
         };
 
-        let derivative = (position_error - *error_prior) * 1000.;
+        let derivative = (position_error - *error_prior) / dt;
 
         let mut pwm_setting = Kp * position_error + Ki * integral + Kd * derivative + bias;
         // limit the pwm setting to max duty cycle
@@ -362,7 +395,7 @@ mod app {
         };
 
         // respawn 1 kHz
-        pid_update::spawn_after(1.millis()).ok();
+        pid_update::spawn_after(respawn_delay_ms.millis()).ok();
     } // PID update loop
 
     // allow user to control the angular rotation rate and control the

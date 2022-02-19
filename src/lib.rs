@@ -17,6 +17,7 @@ fn panic() -> ! {
 }
 
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+
 defmt::timestamp!("{=usize}", {
     // NOTE(no-CAS) `timestamps` runs with interrupts disabled
     let n = COUNT.load(Ordering::Relaxed);
