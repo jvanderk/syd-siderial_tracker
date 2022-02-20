@@ -32,4 +32,5 @@ pub fn exit() -> ! {
     }
 }
 
+pub mod math_embedded;
 pub mod mono;

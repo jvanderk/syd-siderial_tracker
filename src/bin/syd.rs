@@ -9,8 +9,12 @@
 // TIM4 qeimanager (angle encoder)
 
 // help from  henrik_alser at https://github.com/kalkyl/f103-rtic/blob/main/src/mono.rs
-mod rate_update;
 // star tracker servo device app
+
+// broken out tasks in different source files
+mod pid_update;
+mod rate_update;
+
 #[rtic::app(device =  stm32f1xx_hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
 
@@ -45,6 +49,7 @@ mod app {
     use qei as qeimanager;
     use qeimanager::QeiManager;
 
+    use crate::pid_update::pid_update_fn;
     use crate::rate_update::rate_update_fn;
 
     #[monotonic(binds = TIM3, default = true)]
@@ -152,7 +157,7 @@ mod app {
 
         // kick off the threads; they recall themselves using monotonic sw timer
         main::spawn().ok();
-        pid_update::spawn().ok();
+        pid_update_fn::spawn().ok();
         rate_update_fn::spawn().ok();
 
         // return the resources and the monotonic timer
@@ -319,9 +324,10 @@ mod app {
         main::spawn_after(ExtU32::millis(10u32)).ok();
     }
 
-    // update the PID loop
-    // with help from henrik_alser and adamgreig
-    #[task(
+    extern "Rust" {
+        // update the PID loop
+        // with help from henrik_alser and adamgreig
+        #[task(
         shared = [
 	    setpoint,  // setpoint position
             motor_pos, // qei encoder
@@ -334,72 +340,8 @@ mod app {
             pwm_max_duty, // constant
         ]
     )]
-    fn pid_update(cx: pid_update::Context) {
-        let pid_update::LocalResources {
-            respawn_delay_ms,
-            integral_prior, // PID parameters
-            error_prior,
-            pwm_backward, // pwm API
-            pwm_forward,
-            pwm_max_duty,
-        } = cx.local;
-
-        // this is the setpoint maintained by the main() function
-        let setpoint = cx.shared.setpoint;
-
-        // qeimanager4
-        let motor_pos = cx.shared.motor_pos;
-
-        // PID parameters; experimentally determined, probably suboptimal
-        let Kp: f32 = 150.0;
-        let Ki: f32 = 0.01;
-        let Kd: f32 = 16.;
-        let bias: f32 = (*pwm_max_duty * 0) as f32;
-        let dt: f32 = 1000. / *respawn_delay_ms as f32;
-
-        // compute position error
-        // lock returns the error
-        let position_error: f32 = (setpoint, motor_pos).lock(|setpoint, motor_pos| {
-            motor_pos.sample().unwrap();
-            (*setpoint - motor_pos.count()) as f32
-        });
-
-        // pid control
-        let mut integral = *integral_prior + position_error * dt;
-
-        // this is to limit transition effect after retraction
-        if abs(integral) > 100_000.0 {
-            integral = 0.0
-        };
-
-        let derivative = (position_error - *error_prior) / dt;
-
-        let mut pwm_setting = Kp * position_error + Ki * integral + Kd * derivative + bias;
-        // limit the pwm setting to max duty cycle
-        if abs(pwm_setting) > *pwm_max_duty as f32 {
-            pwm_setting = *pwm_max_duty as f32 * sign(pwm_setting);
-        };
-
-        // save the values for next iteration
-        *integral_prior = integral;
-        *error_prior = position_error;
-
-        // set the pwm hw
-        if pwm_setting > 0.0 {
-            // forward
-            pwm_forward.set_duty(pwm_setting as u16);
-            pwm_backward.set_duty(0);
-        } else {
-            // retract
-            pwm_forward.set_duty(0);
-            pwm_backward.set_duty(-pwm_setting as u16);
-        };
-
-        // respawn 1 kHz
-        pid_update::spawn_after(respawn_delay_ms.millis()).ok();
-    } // PID update loop
-
-    //use crate::rate_update::rate_update_fn;
+        fn pid_update_fn(cx: pid_update_fn::Context);
+    }
 
     extern "Rust" {
         // allow user to control the angular rotation rate and control the
@@ -425,19 +367,5 @@ mod app {
     ) -> u32 {
         let millis: dwt_systick_monotonic::fugit::MillisDurationU32 = d.convert();
         millis.ticks()
-    }
-
-    //------------
-    // utility functions not present in f32 implementation in no_std
-    fn sign(f: f32) -> f32 {
-        if f < 0.0 {
-            -1.0
-        } else {
-            1.0
-        }
-    }
-
-    fn abs(x: f32) -> f32 {
-        f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
     }
 }
