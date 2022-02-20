@@ -10,6 +10,55 @@
 
 // help from  henrik_alser at https://github.com/kalkyl/f103-rtic/blob/main/src/mono.rs
 
+use debouncr::Edge;
+use rtic::Mutex;
+use syd::mono::ExtU32;
+
+fn rate_update_fn(cx: app::rate_update_fn::Context) {
+    // rate index in speed table
+    let mut rate_index = cx.shared.rate_index;
+
+    let app::rate_update_fn::LocalResources {
+        rate_switch,
+        rate_switch_state,
+        signal_led,
+        decis,
+    } = cx.local;
+
+    // decimal counter for LED pattern
+    // assuming 100ms between calls cycle takes 20 * 0.1 = 2.0 s
+    *decis = (*decis + 1) % 20;
+
+    // signals in tenths of seconds, start times
+    const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
+
+    // poll button and update state; *rate_index is shared so we need to lock.
+    let pressed: bool = rate_switch.is_low();
+    let edge = rate_switch_state.update(pressed);
+    let r = rate_index.lock(|rate_index| {
+        //  process event
+        if edge == Some(Edge::Falling) {
+            *rate_index = (*rate_index + 1) % 3 // cycle through rates
+        }
+        *rate_index // return value
+    });
+
+    if edge == Some(Edge::Falling) {
+        defmt::println!("rate_index {}", r)
+    }
+
+    // signal led:
+    // switch on if bit# d is on in the pattern of the rate_index
+    if TRACK_PATTERN[r] & (0b1 << *decis) > 0 {
+        signal_led.set_high();
+    } else {
+        signal_led.set_low();
+    };
+
+    // respawn
+    app::rate_update_fn::spawn_after(ExtU32::millis(100u32)).ok();
+}
+
 // star tracker servo device app
 #[rtic::app(device =  stm32f1xx_hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
@@ -36,6 +85,8 @@ mod app {
         timer::{Tim2NoRemap, Tim4NoRemap, Timer},
     };
 
+    use debouncr::{debounce_2, Debouncer, Repeat2};
+
     // External crate qei contains a wrapper around quadrature encoder
     // interface module in HAL so it becomes a i64 in stead of u32
     // device; The Qei from the HAL is an argument for the constructor
@@ -43,8 +94,7 @@ mod app {
     use qei as qeimanager;
     use qeimanager::QeiManager;
 
-    // switch debouncer; used for tracking rate selection
-    use debouncr::{debounce_2, Debouncer, Edge, Repeat2};
+    use crate::rate_update_fn;
 
     #[monotonic(binds = TIM3, default = true)]
     type MyMono = MonoTimer<pac::TIM3, 10_000>;
@@ -152,7 +202,7 @@ mod app {
         // kick off the threads; they recall themselves using monotonic sw timer
         main::spawn().ok();
         pid_update::spawn().ok();
-        rate_update::spawn().ok();
+        rate_update_fn::spawn().ok();
 
         // return the resources and the monotonic timer
         (
@@ -398,62 +448,23 @@ mod app {
         pid_update::spawn_after(respawn_delay_ms.millis()).ok();
     } // PID update loop
 
-    // allow user to control the angular rotation rate and control the
-    // rate indication signal LED; run 10 times/s, fast enough for
-    // tracking human switch control
-    #[task(
-        shared = [
-            rate_index,  // index in rate table
-        ],
-        local = [rate_switch,
-                 rate_switch_state,
-                 signal_led,
-                 decis: u32 = 0 // cycle counter for LED signal
-        ]
-    )]
-    fn rate_update(cx: rate_update::Context) {
-        // rate index in speed table
-        let mut rate_index = cx.shared.rate_index;
+    //use crate::rate_update::rate_update_fn;
 
-        let rate_update::LocalResources {
-            rate_switch,
-            rate_switch_state,
-            signal_led,
-            decis,
-        } = cx.local;
-
-        // decimal counter for LED pattern
-        // assuming 100ms between calls cycle takes 20 * 0.1 = 2.0 s
-        *decis = (*decis + 1) % 20;
-
-        // signals in tenths of seconds, start times
-        const TRACK_PATTERN: [u32; 3] = [0b1, 0b1001, 0b1001001];
-
-        // poll button and update state; *rate_index is shared so we need to lock.
-        let pressed: bool = rate_switch.is_low();
-        let edge = rate_switch_state.update(pressed);
-        let r = rate_index.lock(|rate_index| {
-            //  process event
-            if edge == Some(Edge::Falling) {
-                *rate_index = (*rate_index + 1) % 3 // cycle through rates
-            }
-            *rate_index // return value
-        });
-
-        if edge == Some(Edge::Falling) {
-            defmt::println!("rate_index {}", r)
-        }
-
-        // signal led:
-        // switch on if bit# d is on in the pattern of the rate_index
-        if TRACK_PATTERN[r] & (0b1 << *decis) > 0 {
-            signal_led.set_high();
-        } else {
-            signal_led.set_low();
-        };
-
-        // respawn
-        rate_update::spawn_after(100.millis()).ok();
+    extern "Rust" {
+        // allow user to control the angular rotation rate and control the
+        // rate indication signal LED; run 10 times/s, fast enough for
+        // tracking human switch control
+        #[task(
+            shared = [
+		rate_index,  // index in rate table
+            ],
+            local = [rate_switch,
+                     rate_switch_state,
+                     signal_led,
+                     decis: u32 = 0 // cycle counter for LED signal
+            ]
+	)]
+        fn rate_update_fn(cx: rate_update_fn::Context);
     }
 
     //------------

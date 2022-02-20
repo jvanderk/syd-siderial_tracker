@@ -4,6 +4,7 @@ authors = ["John van der Koijk <33966414+jvanderk@users.noreply.github.com>"]
 name = "syd"
 edition = "2018"
 version = "0.1.0"
+default-run = "syd"
 
 [dependencies]
 defmt = "0.3.0"
